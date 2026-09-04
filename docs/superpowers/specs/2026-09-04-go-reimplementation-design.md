@@ -101,6 +101,21 @@ bin/start.sh python   # Python 版
    - `bin/start.sh go` / `bin/start.sh python` 启动、日志落盘、`stop.sh` 停干净（无残留子进程）。
 5. `docker compose build` 成功，镜像内代理二进制 `--help` 可运行。
 
+## 已否决的备选方案：每 token 专属 tailcat socks 进程池
+
+曾提议为每个 token 启动独立 `tailcat socks` 子进程以"避免每请求重复打洞"。经查阅
+tailcat 源码（`cmd/tailcat/tailcat.go`，`clientSOCKSMode`）证实该前提不成立：
+
+- `tailcat socks` 内部维护 `map[tailcat.Addr]*tailcat.Client`，按目标 token 缓存
+  Client，隧道只在每个 token 的首个 CONNECT 时建立，后续请求复用已建隧道；
+- 打洞在首连后台并行进行，失败自动 DERP 兜底，不阻塞数据传输；
+- 所有 token 共享同一客户端身份密钥。
+
+因此单进程模式原生具备"每 token 隧道仅建一次"的特性，进程池仅能省下首连延迟，
+却带来 N 倍进程/内存/DERP 连接开销。方案否决，维持单共享上游架构。
+（代价说明：每个新 token 的首次 CONNECT 需承担握手延迟，通常几百毫秒，最坏约 15s，
+此为 tailcat 侧固有行为，两版本一致。）
+
 ## 非目标（YAGNI，与 Python 版一致）
 
 - 不支持 UDP ASSOCIATE / BIND（回失败）。
