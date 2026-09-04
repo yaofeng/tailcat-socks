@@ -1,0 +1,21 @@
+services:
+  tailcat-dns-proxy:
+    build:
+      context: ..                       # repo root so COPY src/ + dns.txt resolve
+      dockerfile: docker/Dockerfile
+    image: tailcat-dns-proxy:latest
+    container_name: tailcat-dns-proxy
+    # Mount the CONTAINING DIRECTORY (not the file): editors replace files on
+    # save, and a file-level bind-mount pins the old inode so hot-reload would
+    # miss it. A directory mount tracks the rename, so the proxy sees edits.
+    volumes:
+      - ../:/app/config:ro
+    ports:
+      - "1080:1080"                     # SOCKS5 for clients: --socks5-hostname <host>:1080
+    environment:
+      LISTEN: "0.0.0.0:1080"            # bind all ifaces inside the container
+      UPSTREAM: "127.0.0.1:0"           # tailcat socks -> random high port (internal)
+      DNS_FILE: "/app/config/dns.txt"   # live-mounted, hot-reloaded
+      TAILCAT_BIN: "tailcat"
+    restart: unless-stopped
+    # tailcat needs to reach DERP/STUN over the network; give it outbound access.

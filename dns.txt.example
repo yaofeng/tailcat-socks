@@ -1,0 +1,8 @@
+# token                 domains (空格/Tab 分隔,可多个;一个 token 可对应多域名)
+#
+# 一行一个 tailcat token,后跟它对应的任意多个域名。`#` 开头为注释,空行忽略。
+# 真实 token 请写入被 git 忽略的 dns.txt(不要提交到仓库)。
+#
+# 示例(把 REPLACE_WITH_TAILCAT_TOKEN 换成 `tailcat serve` 生成的 tc... 串):
+REPLACE_WITH_TAILCAT_TOKEN    www.example.com  api.example.com
+REPLACE_WITH_TAILCAT_TOKEN_2  foo.com  bar.com
