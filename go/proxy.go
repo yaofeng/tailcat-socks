@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,6 +31,9 @@ type Server struct {
 	DNSMap       *DNSMap
 	UpstreamAddr string
 	ln           net.Listener
+	// relayIdle is how long the relay tolerates silence in either direction
+	// before tearing the session down.
+	relayIdle time.Duration
 }
 
 // NewServer binds the listen address. Use ActualAddr for the resolved port
@@ -39,7 +43,7 @@ func NewServer(dnsMap *DNSMap, upstreamAddr, listen string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{DNSMap: dnsMap, UpstreamAddr: upstreamAddr, ln: ln}, nil
+	return &Server{DNSMap: dnsMap, UpstreamAddr: upstreamAddr, ln: ln, relayIdle: relayIdleTimeout}, nil
 }
 
 // ActualAddr returns the bound address once NewServer has succeeded.
@@ -130,14 +134,16 @@ func (s *Server) serveConn(client net.Conn) {
 		socksFail(client)
 		return
 	}
+	up.SetDeadline(time.Now().Add(upstreamDialTimeout)) // bound the handshake, like create_connection(timeout=15)
 	if err := upstreamConnect(up, target, port); err != nil {
 		up.Close()
 		socksFail(client)
 		return
 	}
+	up.SetDeadline(time.Time{}) // relay phase: shared idle timeout only
 
 	client.Write(socksOKReply)
-	relay(client, up)
+	relay(client, up, s.relayIdle)
 	up.Close()
 }
 
@@ -152,6 +158,9 @@ func readATYPAddr(r io.Reader, atyp byte) (string, error) {
 		}
 		return net.IP(b[:]).String(), nil
 	case 0x03: // domain
+		// Deliberate divergence from Python: Python's ascii decode drops
+		// non-ASCII domain bytes, Go forwards them raw and lets the upstream
+		// reject — both fail the session, no wrong-destination risk.
 		var l [1]byte
 		if _, err := io.ReadFull(r, l[:]); err != nil {
 			return "", err
@@ -218,18 +227,16 @@ func upstreamConnect(up net.Conn, host string, port uint16) error {
 }
 
 // relay copies data between client and upstream in both directions until
-// either side closes or the idle timeout fires (the Go analog of the Python
-// version's select() loop with a 300s timeout).
-func relay(client, upstream net.Conn) {
+// either side closes or the idle timeout fires. Like the Python version's
+// select() loop, the idle clock is SHARED: traffic in either direction
+// resets the window for both, so a healthy one-way transfer (e.g. a long
+// download with no client upload) is never killed as idle.
+func relay(client, upstream net.Conn, idle time.Duration) {
+	var clock atomic.Int64
+	clock.Store(time.Now().UnixNano())
 	done := make(chan struct{}, 2)
-	go func() {
-		copyWithIdleTimeout(upstream, client, relayIdleTimeout)
-		done <- struct{}{}
-	}()
-	go func() {
-		copyWithIdleTimeout(client, upstream, relayIdleTimeout)
-		done <- struct{}{}
-	}()
+	go func() { copyWithIdleTimeout(upstream, client, idle, &clock); done <- struct{}{} }()
+	go func() { copyWithIdleTimeout(client, upstream, idle, &clock); done <- struct{}{} }()
 	<-done
 	// one direction finished: close both so the other unblocks
 	client.Close()
@@ -237,20 +244,30 @@ func relay(client, upstream net.Conn) {
 	<-done
 }
 
-// copyWithIdleTimeout copies src to dst, giving up if no data arrives
-// within idle. Like the Python relay, an idle timeout or EOF on either side
-// ends the whole relay.
-func copyWithIdleTimeout(dst, src net.Conn, idle time.Duration) error {
+// copyWithIdleTimeout copies src to dst, giving up if no data arrives from
+// anywhere (either direction) within idle. The deadline is derived from the
+// shared activity clock (last activity + idle), reproducing the Python
+// relay's single select() window; writes stay deadline-free like in Python.
+// A blocked Read cannot observe clock updates, so on a timeout we re-arm and
+// keep waiting whenever another direction has moved the clock past the
+// deadline that just fired — only true idleness returns.
+func copyWithIdleTimeout(dst, src net.Conn, idle time.Duration, clock *atomic.Int64) error {
 	buf := make([]byte, 65536)
 	for {
-		src.SetReadDeadline(time.Now().Add(idle))
+		deadline := time.Unix(0, clock.Load()).Add(idle)
+		src.SetReadDeadline(deadline)
 		n, rerr := src.Read(buf)
 		if n > 0 {
+			clock.Store(time.Now().UnixNano())
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return werr
 			}
 		}
 		if rerr != nil {
+			if ne, ok := rerr.(net.Error); ok && ne.Timeout() &&
+				time.Unix(0, clock.Load()).Add(idle).After(deadline) {
+				continue // activity elsewhere extended the window; keep waiting
+			}
 			return rerr
 		}
 	}
