@@ -120,3 +120,25 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	}
 	t.Fatal("condition not met within timeout")
 }
+
+func TestWatchDNSFileKeepsPreviousMapOnReadError(t *testing.T) {
+	path := writeTemp(t, "tcA keep.com\n")
+	m := &DNSMap{}
+	stop := make(chan struct{})
+	defer close(stop)
+	go WatchDNSFile(path, m, 50*time.Millisecond, stop)
+	waitFor(t, 3*time.Second, func() bool { return m.Load()["keep.com"] == "tcA" })
+
+	// Make reads fail while stat still succeeds: replace the file with a directory.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A few ticks later the old mapping must still be served.
+	time.Sleep(300 * time.Millisecond)
+	if m.Load()["keep.com"] != "tcA" {
+		t.Fatal("read error must keep previous mapping")
+	}
+}

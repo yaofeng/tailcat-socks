@@ -57,18 +57,23 @@ func RewriteHost(host string, m map[string]string) string {
 }
 
 // WatchDNSFile polls path's mtime every interval; on change it reloads the
-// mapping into m. Read errors keep the previous mapping. It performs an
+// mapping into m. Read errors keep the previous mapping, and a failed
+// initial load is retried on every tick until it succeeds. It performs an
 // initial load so the map is populated even if the caller started empty.
 // Returns when stop is closed.
 func WatchDNSFile(path string, m *DNSMap, interval time.Duration, stop <-chan struct{}) {
-	if first, err := LoadDNSFile(path); err == nil {
-		m.Store(first)
-	} else {
-		log.Printf("[tailcat-dns-proxy] initial load of %s failed: %v", path, err)
-	}
+	// Stat before the initial load: a write landing between the two leaves
+	// lastMod at the older mtime, so the loop's next tick sees the change
+	// and reloads instead of silently swallowing the new content.
 	var lastMod time.Time
 	if fi, err := os.Stat(path); err == nil {
 		lastMod = fi.ModTime()
+	}
+	if first, err := LoadDNSFile(path); err == nil {
+		m.Store(first)
+	} else {
+		lastMod = time.Time{} // retry the initial load on every tick (mtime != lastMod)
+		log.Printf("[tailcat-dns-proxy] initial load of %s failed: %v", path, err)
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
