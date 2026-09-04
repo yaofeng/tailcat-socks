@@ -20,7 +20,6 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(dir)
 	fakeTailcatBin = filepath.Join(dir, "fake-tailcat")
 	build := exec.Command("go", "build", "-o", fakeTailcatBin, "./testdata/fake-tailcat")
 	build.Stderr = os.Stderr
@@ -28,7 +27,9 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "build fake-tailcat:", err)
 		os.Exit(1)
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 func TestParseAddr(t *testing.T) {
@@ -40,8 +41,10 @@ func TestParseAddr(t *testing.T) {
 		wantErr  bool
 	}{
 		{"127.0.0.1:1080", 0, "127.0.0.1", 1080, false},
+		{":8080", 0, "127.0.0.1", 8080, false},
 		{"127.0.0.1:0", 0, "127.0.0.1", 0, false},
 		{"example.com:9999", 0, "example.com", 9999, false},
+		{"[::1]:1080", 0, "[::1]", 1080, false},
 		{"1080", 0, "127.0.0.1", 1080, false}, // bare port, empty host -> default
 		{"127.0.0.1", 0, "", 0, true},         // bare IP -> Atoi fails (parity with Python)
 		{"host:abc", 0, "", 0, true},

@@ -5,6 +5,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -34,6 +35,11 @@ func main() {
 }
 
 func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch bool) int {
+	// Install the signal handler before doing anything else, so SIGINT/SIGTERM
+	// arriving during launch cannot orphan the tailcat child.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
 	first, err := LoadDNSFile(dnsFile)
 	if err != nil {
 		log.Printf("[tailcat-dns-proxy] cannot load %s: %v", dnsFile, err)
@@ -42,6 +48,16 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	dnsMap := &DNSMap{}
 	dnsMap.Store(first)
 
+	// Normalize --listen with Python's parse_addr semantics: a bare port or an
+	// empty host means loopback, so ":8080" cannot bind every interface, and
+	// bracketed IPv6 comes out well-formed for net.Listen.
+	lHost, lPort, err := parseAddr(listen, 0)
+	if err != nil {
+		log.Printf("[tailcat-dns-proxy] bad --listen: %v", err)
+		return 1
+	}
+	listen = net.JoinHostPort(strings.Trim(lHost, "[]"), strconv.Itoa(lPort))
+
 	// Resolve the tailcat socks listen port: explicit port wins, else high random.
 	upHost, upPort, err := parseAddr(upstream, 0)
 	if err != nil {
@@ -49,9 +65,9 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 		return 1
 	}
 	if upPort == 0 {
-		upPort = freeHighPort(upHost)
+		upPort = freeHighPort(strings.Trim(upHost, "[]"))
 	}
-	upAddr := net.JoinHostPort(upHost, strconv.Itoa(upPort))
+	upAddr := net.JoinHostPort(strings.Trim(upHost, "[]"), strconv.Itoa(upPort))
 
 	srv, err := NewServer(dnsMap, upAddr, listen)
 	if err != nil {
@@ -89,12 +105,12 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 		len(first), len(tokenSet(first)))
 	log.Printf("[tailcat-dns-proxy] upstream %s", upAddr)
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case <-sig:
 	case err := <-serveErr:
-		if err != nil {
+		// srv.Close() during shutdown makes Serve() report net.ErrClosed;
+		// that is not a real failure, so keep signal exits quiet.
+		if err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Printf("[tailcat-dns-proxy] server error: %v", err)
 		}
 	}
