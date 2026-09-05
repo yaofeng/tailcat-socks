@@ -14,11 +14,11 @@ COPY go/ /src/go/
 RUN cd /src/go && go build -trimpath -ldflags="-s -w" -o /out/tailcat-dns-proxy .
 
 # ---- runtime stage ----
-FROM debian:bookworm-slim
+# Alpine, not debian-slim: both binaries are fully static (CGO off), so the
+# 116MB glibc base buys nothing; alpine's sh keeps the env-expanding CMD intact.
+FROM alpine:3.22
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates
 
 COPY --from=build /out/tailcat-dns-proxy /usr/local/bin/tailcat-dns-proxy
 COPY --from=build /go/bin/tailcat /usr/local/bin/tailcat
