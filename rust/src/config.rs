@@ -1,5 +1,7 @@
 use crate::error::ConfigError;
 use clap::Parser;
+use std::io::Read;
+use std::net::TcpListener;
 
 /// CLI flags, identical names/defaults to the Go/Python versions.
 #[derive(Parser, Debug)]
@@ -64,6 +66,35 @@ pub fn join_host_port(host: &str, port: u16) -> String {
     }
 }
 
+/// 64 bits from /dev/urandom, falling back to wall-clock nanos (no rand dep).
+fn random_u64() -> u64 {
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let mut b = [0u8; 8];
+        if f.read_exact(&mut b).is_ok() {
+            return u64::from_le_bytes(b);
+        }
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Probe a free high port (20000..=60999) at random, like the Go/Python
+/// versions; after 20 failed tries fall back to an OS-assigned port. The
+/// port-0 fallback failing is practically unreachable (TCP stack broken);
+/// panic there, mirroring Go's log.Fatalf.
+pub fn free_high_port(host: &str) -> u16 {
+    for _ in 0..20 {
+        let p = 20000 + (random_u64() % 41000) as u16;
+        if TcpListener::bind(join_host_port(host, p)).is_ok() {
+            return p;
+        }
+    }
+    let ln = TcpListener::bind(join_host_port(host, 0)).expect("cannot find a free port");
+    ln.local_addr().expect("local_addr").port()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +137,15 @@ mod tests {
         assert_eq!(join_host_port("::1", 1080), "[::1]:1080");
         assert_eq!(join_host_port("127.0.0.1", 1080), "127.0.0.1:1080");
         assert_eq!(join_host_port("localhost", 0), "localhost:0");
+    }
+
+    #[test]
+    fn free_high_port_returns_bindable_high_port() {
+        let p = free_high_port("127.0.0.1");
+        assert!((20000..=60999).contains(&p), "port {p} out of high range");
+        // typically still bindable right after (same assertion as Go)
+        if let Ok(ln) = std::net::TcpListener::bind(join_host_port("127.0.0.1", p)) {
+            drop(ln);
+        }
     }
 }
