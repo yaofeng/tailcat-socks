@@ -1,0 +1,15 @@
+[package]
+name = "tailcat-dns-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "SOCKS5 front proxy that rewrites domains to tailcat tokens (Rust implementation)"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "signal", "time", "macros", "io-util"] }
+clap = { version = "4", features = ["derive"] }
+arc-swap = "1"
+tokio-util = "0.7"        # CancellationToken
+thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"              # SIGTERM to the tailcat child (tokio only offers SIGKILL)

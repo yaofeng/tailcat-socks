@@ -3,3 +3,4 @@ __pycache__/
 run/
 dns.txt
 go/bin/
+rust/target/
