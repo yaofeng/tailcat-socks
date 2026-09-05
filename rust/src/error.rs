@@ -12,7 +12,7 @@ pub struct ConfigError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DnsFileError {
-    #[error("cannot read {path}: {source}")]
+    #[error("cannot load {path}: {source}")]
     Read {
         path: String,
         #[source]
