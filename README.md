@@ -45,7 +45,7 @@ tcoAbCdEf789     www.example.com
 
 - Go 版:Go 1.23+(构建用;或直接用已构建的 `go/bin/tailcat-dns-proxy`)
 - Python 版:Python 3.8+(仅标准库)
-- Rust 版:Rust 1.75+(构建用;或直接用已构建的 `rust/target/release/tailcat-dns-proxy`)
+- Rust 版:Rust 1.85+(构建用;或直接用已构建的 `rust/target/release/tailcat-dns-proxy`)
 - `tailcat`:https://github.com/tailscale/tailcat(`brew install tailcat` 或 `go install github.com/tailscale/tailcat/cmd/tailcat@latest`;注意 tailcat@latest 需要 Go 1.27+ 工具链)
 
 ## 快速开始(裸机)

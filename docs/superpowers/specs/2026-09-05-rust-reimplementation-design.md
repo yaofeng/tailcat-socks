@@ -6,7 +6,7 @@
 ## 目标
 
 1. 新建 `rust/` 目录，作为与 `python/`、`go/` 并列的**第三个生产行为一致**的实现。
-2. 技术选型：tokio 生态的「地道 Rust」写法（方案 B）——`clap` derive 配置结构、`arc-swap` 原子映射、`tokio_util::CancellationToken` 生命周期、`thiserror` + `anyhow` 错误分层。
+2. 技术选型：tokio 生态的「地道 Rust」写法（方案 B）——`clap` derive 配置结构、`arc-swap` 原子映射、`tokio_util::CancellationToken` 生命周期、`thiserror` 错误类型。
 3. 可观察行为与 Go/Python 版逐段对齐：flag 同名同默认、SOCKS5 字节级行为、改写规则、热加载、tailcat 自动拉起/回收、relay 半关防 RST 与共享空闲超时。
 4. `bin/{start,stop,restart}.sh` 支持 `rust`；README 更新。**Docker 不动**（镜像继续基于 Go 版构建）。
 
@@ -26,7 +26,7 @@ tailcat-socks/
 │   │   ├── error.rs       # thiserror 错误类型
 │   │   ├── logging.rs     # [tailcat-dns-proxy] 前缀日志
 │   │   └── bin/fake-tailcat.rs  # 测试用假 tailcat（cargo bin 目标）
-│   └── tests/               # 集成测试（e2e / dnsmap 热加载 / relay 专项 / 自动拉起）
+│   └── tests/               # 集成测试（e2e / autolaunch / waitready_deadport；dnsmap 热加载与 relay 为 src 内单元测试）
 ├── bin/{start,stop,restart}.sh   # 增加 rust 选项
 └── (其余不变)
 ```
@@ -94,7 +94,7 @@ libc       = "0.2"    # 仅 unix：向 tailcat 子进程发 SIGTERM（tokio 只�
 
 ### error（error.rs）
 
-`thiserror`：`ConfigError`（地址解析失败）、`DnsFileError`（读/解析失败）、`SocksError`（协议违规/上游拒绝）。IO 错误直接透传 `std::io::Error`。`main` 用 `anyhow::Context` 补充上下文并映射退出码。
+`thiserror`：`ConfigError`（地址解析失败）、`DnsFileError`（读/解析失败）、`SocksError`（协议违规/上游拒绝）。IO 错误直接透传 `std::io::Error`。`main` 的错误路径统一为「打日志 + 退出码」，不引入 anyhow。
 
 ## bin/ 脚本集成
 
