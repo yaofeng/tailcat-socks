@@ -64,6 +64,8 @@ PID=$!
 echo "$PID" > "$PID_FILE"
 
 # Bail out loudly if the proxy died immediately (bad --dns-file, port in use).
+# 0.4s catches fast fails only; a later crash still leaves a stale pid file
+# for stop.sh to clean up.
 sleep 0.4
 if ! kill -0 "$PID" 2>/dev/null; then
   echo "proxy [$IMPL] exited immediately (pid $PID); last log lines:" >&2

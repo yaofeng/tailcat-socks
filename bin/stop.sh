@@ -16,11 +16,15 @@ case "$IMPL" in
 esac
 
 # Only signal a pid that really is a tailcat-dns-proxy: a pid file can outlive
-# a reboot and land on an unrelated process.
+# a reboot and land on an unrelated process. Match exact argv tokens, not
+# substrings — e.g. `tail -f run/tailcat-dns-proxy-go.log` mentions the proxy
+# but is not the proxy.
 is_ours() {
-  local cmdline
-  cmdline="$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null || true)"
-  [[ "$cmdline" == *tailcat-dns-proxy* || "$cmdline" == *tailcat_dns_proxy.py* ]]
+  local token
+  while IFS= read -r -d '' token; do
+    [[ "$token" == *tailcat-dns-proxy || "$token" == *tailcat_dns_proxy.py ]] && return 0
+  done 2>/dev/null < "/proc/$1/cmdline"
+  return 1
 }
 
 STOPPED=0
