@@ -823,7 +823,7 @@ pub async fn watch(path: std::path::PathBuf, map: DnsMap, interval: std::time::D
         }
         Err(err) => {
             last_mod = None; // retry the initial load on every tick
-            crate::logging::log_line(format!("initial load of {} failed: {err}", path.display()));
+            crate::logging::log_line(format!("initial load failed: {err}")); // err Display already includes path
         }
     }
 
@@ -2237,7 +2237,7 @@ async fn run(cfg: Config) -> i32 {
     let first = match load_dns_file(std::path::Path::new(&cfg.dns_file)) {
         Ok(m) => m,
         Err(err) => {
-            log_line(format!("cannot load {}: {err}", cfg.dns_file));
+            log_line(format!("{err}")); // DnsFileError Display already says "cannot load <path>: ..."
             return 1;
         }
     };
