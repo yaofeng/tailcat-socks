@@ -2,5 +2,6 @@
 //! tailcat tokens (tc...) and chains to a single standalone `tailcat socks`
 //! upstream. Rust implementation; see README.md for usage.
 
+pub mod config;
 pub mod error;
 pub mod logging;
