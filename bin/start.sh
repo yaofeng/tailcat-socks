@@ -41,9 +41,25 @@ TAILCAT_BIN="${TAILCAT_BIN:-tailcat}"
 
 mkdir -p "$RUN_DIR"
 
-if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  echo "already running [$IMPL] (pid $(cat "$PID_FILE"))"
-  exit 1
+# A pid file can outlive a reboot and land on an unrelated live process; only
+# refuse to start when the pid really is ours (same exact-argv-token check as
+# stop.sh — `tail -f run/…-go.log` mentions the proxy but is not the proxy).
+is_ours() {
+  local token
+  while IFS= read -r -d '' token; do
+    [[ "$token" == *tailcat-dns-proxy || "$token" == *tailcat_dns_proxy.py ]] && return 0
+  done 2>/dev/null < "/proc/$1/cmdline"
+  return 1
+}
+
+if [[ -f "$PID_FILE" ]]; then
+  OLD_PID="$(cat "$PID_FILE")"
+  if kill -0 "$OLD_PID" 2>/dev/null && is_ours "$OLD_PID"; then
+    echo "already running [$IMPL] (pid $OLD_PID)"
+    exit 1
+  fi
+  echo "stale pid file $PID_FILE (pid $OLD_PID not alive or not ours); removing"
+  rm -f "$PID_FILE"
 fi
 
 # Build the Go proxy if the binary is missing (requires a Go toolchain).

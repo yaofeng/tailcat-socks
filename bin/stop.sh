@@ -39,8 +39,11 @@ for PID_FILE in "${PID_FILES[@]}"; do
   STOPPED=1
   echo "stopping pid $PID ..."
   kill -TERM "$PID" 2>/dev/null || true
-  # 8s > the proxy's own 5s child-escalation so it can finish cleaning up.
-  for _ in $(seq 1 32); do
+  # 20s covers the proxy's two longest exit paths: its 5s TERM->KILL child
+  # escalation, and a TERM latched during the <=15s upstream-startup wait
+  # (acted on only once that wait returns). Only a proxy that truly ignores
+  # TERM waits out the full window before the KILL below.
+  for _ in $(seq 1 80); do
     kill -0 "$PID" 2>/dev/null || break
     sleep 0.25
   done
