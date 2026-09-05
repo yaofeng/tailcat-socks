@@ -1,13 +1,17 @@
 # ---- build stage: compile the Go proxy and the tailcat binary ----
 FROM golang:1.27.1-bookworm AS build
 
+# Dependency-heavy layers first: installing tailcat (and its module downloads)
+# must not re-run when proxy sources change. GOPROXY is pre-approved for this
+# network (proxy.golang.org unreachable). CGO off keeps both binaries static so
+# the slim runtime stage needs nothing else.
+ENV GOPROXY=https://goproxy.cn,direct \
+    CGO_ENABLED=0
+RUN go install github.com/tailscale/tailcat/cmd/tailcat@latest
+
 WORKDIR /src
 COPY go/ /src/go/
-ENV GOPROXY=https://goproxy.cn,direct
-# Static binary (CGO off) so the slim runtime stage needs nothing else.
-RUN cd /src/go && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/tailcat-dns-proxy .
-# Pin a version for reproducibility; bump as needed.
-RUN go install github.com/tailscale/tailcat/cmd/tailcat@latest
+RUN cd /src/go && go build -trimpath -ldflags="-s -w" -o /out/tailcat-dns-proxy .
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim

@@ -1,7 +1,7 @@
 services:
   tailcat-dns-proxy:
     build:
-      context: ..                       # repo root so COPY src/ + dns.txt resolve
+      context: ..                       # repo root so COPY go/ + dns.txt.example resolve
       dockerfile: docker/Dockerfile
     image: tailcat-dns-proxy:latest
     container_name: tailcat-dns-proxy
