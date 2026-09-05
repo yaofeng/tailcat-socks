@@ -7,6 +7,7 @@ use tailcat_dns_proxy::dnsmap::{load_dns_file, token_set, watch, DnsMap};
 use tailcat_dns_proxy::logging::log_line;
 use tailcat_dns_proxy::proxy::Server;
 use tailcat_dns_proxy::tailcat::{spawn_socks, terminate, wait_ready};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
 fn main() {
@@ -21,7 +22,6 @@ fn main() {
 async fn run(cfg: Config) -> i32 {
     // Install the signal handler before doing anything else, so SIGINT/
     // SIGTERM arriving during launch cannot orphan the tailcat child.
-    use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
 
@@ -32,8 +32,11 @@ async fn run(cfg: Config) -> i32 {
             return 1;
         }
     };
+    // Count before the store consumes `first`; the pre-store below only
+    // matters under --no-watch (watch() does its own initial load).
+    let counts = (first.len(), token_set(&first).len());
     let dns_map = DnsMap::new();
-    dns_map.store(first.clone());
+    dns_map.store(first);
 
     // Normalize --listen with the Python parse_addr semantics: a bare port
     // or an empty host means loopback, so ":8080" cannot bind every
@@ -110,27 +113,35 @@ async fn run(cfg: Config) -> i32 {
         ));
     }
 
-    let serve = tokio::spawn(async move { srv.serve(ln).await });
+    // `mut` so the select branch can await it by reference and the handle
+    // stays owned for abort() after the select.
+    let mut serve = tokio::spawn(async move { srv.serve(ln).await });
 
     log_line(format!("listening socks5h://{actual}"));
     log_line(format!(
         "{} domain(s) mapped -> {} token(s)",
-        first.len(),
-        token_set(&first).len()
+        counts.0, counts.1
     ));
     log_line(format!("upstream {up_addr}"));
 
     tokio::select! {
         _ = sigterm.recv() => {}
         _ = sigint.recv() => {}
-        err = async { serve.await.expect("serve task panicked") } => {
-            // Server errors on shutdown are net.ErrClosed-equivalent noise;
-            // keep signal exits quiet like the Go version.
+        err = async { (&mut serve).await.expect("serve task panicked") } => {
+            // Nothing ever closes the listener on the shutdown path, so this
+            // branch only fires on a genuine early serve failure; signal
+            // exits go through abort() below and stay quiet by construction,
+            // like the Go version's net.ErrClosed suppression.
             if let Err(e) = err {
                 log_line(format!("server error: {e}"));
             }
         }
     }
+    // Abort the serve task before reaping the child (Go's srv.Close() at
+    // go/main.go:118): it owns `ln`, so aborting drops the listener and new
+    // clients are refused during the terminate window instead of completing
+    // handshakes against a dying upstream. No-op if serve already finished.
+    serve.abort();
     stop.cancel();
     if let Some(c) = child.as_mut() {
         terminate(c).await;
