@@ -115,9 +115,10 @@ impl Server {
     }
 }
 
-/// Read a SOCKS5 address of the given ATYP. IPv4/IPv6 are textualized like
-/// Go (so IP-literal mappings rewrite identically); domains keep their raw
-/// bytes, non-UTF-8 included (deliberate, shared with Go).
+/// Read a SOCKS5 address of the given ATYP. IPv4 textualization matches Go;
+/// IPv6 matches Go for ordinary addresses (see the 0x04 branch for the one
+/// IPv4-mapped divergence). Domains keep their raw bytes, non-UTF-8 included
+/// (deliberate, shared with Go).
 async fn read_atyp_addr<R: AsyncRead + Unpin>(r: &mut R, atyp: u8) -> Result<Vec<u8>, SocksError> {
     match atyp {
         0x01 => {
@@ -137,6 +138,10 @@ async fn read_atyp_addr<R: AsyncRead + Unpin>(r: &mut R, atyp: u8) -> Result<Vec
         0x04 => {
             let mut b = [0u8; 16];
             r.read_exact(&mut b).await?;
+            // Divergence from Go (matches Python's inet_ntop instead): Rust
+            // textualizes IPv4-mapped IPv6 keeping the `::ffff:` prefix
+            // ("::ffff:127.0.0.1"), where Go strips it ("127.0.0.1") — so a
+            // mapped client address re-forwards as ATYP 4 here, ATYP 1 in Go.
             Ok(std::net::Ipv6Addr::from(b).to_string().into_bytes())
         }
         other => Err(SocksError::UnsupportedAtyp(other)),
@@ -170,7 +175,11 @@ fn atyp_for(host: &[u8]) -> Atyp {
 /// SOCKS5 client handshake with the upstream, asking it to connect to
 /// host:port. Domains go as ATYP 0x03 (socks5h: the upstream resolves);
 /// IPs use ATYP 0x01/0x04.
-async fn upstream_connect(up: &mut TcpStream, host: &[u8], port: u16) -> Result<(), SocksError> {
+pub(crate) async fn upstream_connect(
+    up: &mut TcpStream,
+    host: &[u8],
+    port: u16,
+) -> Result<(), SocksError> {
     up.write_all(&[0x05, 0x01, 0x00]).await?;
     let mut greet = [0u8; 2];
     up.read_exact(&mut greet).await?;
@@ -280,6 +289,7 @@ pub async fn relay(client: &mut TcpStream, upstream: &mut TcpStream, idle: Durat
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// Minimal SOCKS5 upstream (stand-in for `tailcat socks`): accepts any
     /// CONNECT, records the target on the channel, echoes data back
@@ -489,5 +499,372 @@ mod tests {
         c.read_exact(&mut rep).await.unwrap();
         assert_eq!(&rep, &[0x05, 0xFF], "want 05 FF, got {rep:?}");
         handle.abort();
+    }
+
+    /// start_proxy with a short relay idle window (for exercising the shared
+    /// idle clock without waiting 300s).
+    async fn start_proxy_with_idle(
+        mapping: &[(&[u8], &[u8])],
+        upstream: &str,
+        idle: Duration,
+    ) -> (String, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let m = mapping
+            .iter()
+            .map(|(d, t)| (d.to_ascii_lowercase(), t.to_vec()))
+            .collect::<HashMap<Vec<u8>, Vec<u8>>>();
+        let dns_map = DnsMap::new();
+        dns_map.store(m);
+        let (ln, mut srv) = Server::bind(dns_map, upstream, "127.0.0.1:0")
+            .await
+            .unwrap();
+        srv.relay_idle = idle;
+        let addr = ln.local_addr().unwrap().to_string();
+        let handle = tokio::spawn({
+            let srv = srv.clone();
+            async move { srv.serve(ln).await }
+        });
+        (addr, handle)
+    }
+
+    /// Completes the SOCKS5 handshake and then swallows everything without
+    /// ever writing back, counting payload bytes.
+    async fn silent_upstream() -> std::io::Result<(String, Arc<AtomicU64>)> {
+        let ln = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = ln.local_addr()?.to_string();
+        let got = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&got);
+        tokio::spawn(async move {
+            let Ok((mut conn, _)) = ln.accept().await else {
+                return;
+            };
+            let mut hdr = [0u8; 2];
+            let _ = conn.read_exact(&mut hdr).await;
+            let mut methods = vec![0u8; hdr[1] as usize];
+            let _ = conn.read_exact(&mut methods).await;
+            let _ = conn.write_all(&[0x05, 0x00]).await;
+            let mut req = [0u8; 4];
+            let _ = conn.read_exact(&mut req).await;
+            match req[3] {
+                0x03 => {
+                    let mut l = [0u8; 1];
+                    let _ = conn.read_exact(&mut l).await;
+                    let mut b = vec![0u8; l[0] as usize];
+                    let _ = conn.read_exact(&mut b).await;
+                }
+                0x01 => {
+                    let mut b = [0u8; 4];
+                    let _ = conn.read_exact(&mut b).await;
+                }
+                0x04 => {
+                    let mut b = [0u8; 16];
+                    let _ = conn.read_exact(&mut b).await;
+                }
+                _ => {}
+            }
+            let mut pb = [0u8; 2];
+            let _ = conn.read_exact(&mut pb).await;
+            let _ = conn.write_all(&SOCKS_OK_REPLY).await;
+            let mut buf = [0u8; 4096];
+            loop {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        counter.fetch_add(n as u64, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+        Ok((addr, got))
+    }
+
+    /// Answer CONNECT, write payload, close WITHOUT reading anything more
+    /// (the client's HTTP GET arrives after our close — the original
+    /// curl-exit-56 RST scenario).
+    async fn early_close_upstream(payload: &[u8]) -> std::io::Result<String> {
+        let ln = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = ln.local_addr()?.to_string();
+        let payload = payload.to_vec();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = ln.accept().await else {
+                    return;
+                };
+                let payload = payload.clone();
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; 2];
+                    if conn.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let mut methods = vec![0u8; hdr[1] as usize];
+                    if conn.read_exact(&mut methods).await.is_err() {
+                        return;
+                    }
+                    if conn.write_all(&[0x05, 0x00]).await.is_err() {
+                        return;
+                    }
+                    let mut req = [0u8; 4];
+                    if conn.read_exact(&mut req).await.is_err() {
+                        return;
+                    }
+                    let skip = match req[3] {
+                        0x03 => {
+                            let mut l = [0u8; 1];
+                            if conn.read_exact(&mut l).await.is_err() {
+                                return;
+                            }
+                            l[0] as usize
+                        }
+                        0x01 => 4,
+                        0x04 => 16,
+                        _ => 0,
+                    };
+                    let mut rest = vec![0u8; skip + 2];
+                    if conn.read_exact(&mut rest).await.is_err() {
+                        return;
+                    }
+                    let _ = conn.write_all(&SOCKS_OK_REPLY).await;
+                    let _ = conn.write_all(&payload).await;
+                    // ...and close without reading the client's request bytes.
+                });
+            }
+        });
+        Ok(addr)
+    }
+
+    /// Replies 05 00 to the greeting, then reads exactly `total` bytes
+    /// (greeting + request) and hands them to the receiver. For byte-level
+    /// assertions on what the proxy sends upstream.
+    async fn capture_upstream(
+        total: usize,
+    ) -> std::io::Result<(String, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
+        let ln = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = ln.local_addr()?.to_string();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            let Ok((mut conn, _)) = ln.accept().await else {
+                return;
+            };
+            let _ = conn.write_all(&[0x05, 0x00]).await;
+            let mut buf = vec![0u8; total];
+            if conn.read_exact(&mut buf).await.is_err() {
+                return;
+            }
+            let _ = tx.send(buf).await;
+        });
+        Ok((addr, rx))
+    }
+
+    /// Completes the handshake then refuses the CONNECT.
+    async fn refuse_upstream() -> std::io::Result<String> {
+        let ln = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = ln.local_addr()?.to_string();
+        tokio::spawn(async move {
+            let Ok((mut conn, _)) = ln.accept().await else {
+                return;
+            };
+            let mut hdr = [0u8; 2];
+            let _ = conn.read_exact(&mut hdr).await;
+            let mut methods = vec![0u8; hdr[1] as usize];
+            let _ = conn.read_exact(&mut methods).await;
+            let _ = conn.write_all(&[0x05, 0x00]).await;
+            let mut req = [0u8; 4];
+            let _ = conn.read_exact(&mut req).await;
+            let mut rest = vec![0u8; 4 + 2]; // ATYP 1 addr + port
+            let _ = conn.read_exact(&mut rest).await;
+            let _ = conn.write_all(&SOCKS_FAIL_REPLY).await;
+        });
+        Ok(addr)
+    }
+
+    // Mirrors go/proxy_test.go TestRelayIdleClockIsSharedAcrossDirections:
+    // one shared clock reset by traffic in EITHER direction. A one-way
+    // transfer (client pumps, upstream never answers) must not be killed by
+    // the idle timeout just because one side is silent.
+    #[tokio::test]
+    async fn relay_idle_clock_is_shared_across_directions() {
+        let (up, got) = silent_upstream().await.unwrap();
+        // 200ms idle; the pump below runs 1.2s (6x idle) one-way only.
+        let (addr, handle) = start_proxy_with_idle(&[], &up, Duration::from_millis(200)).await;
+
+        let mut c = socks_connect(&addr, b"plain.example", 80).await;
+
+        const PINGS: usize = 24;
+        for _ in 0..PINGS {
+            tokio::time::timeout(Duration::from_secs(2), c.write_all(b"PING\n"))
+                .await
+                .expect("write timed out")
+                .expect("relay died during one-way transfer");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Every ping must have made it through the relay (5 bytes each).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while got.load(Ordering::SeqCst) < (PINGS * 5) as u64
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            got.load(Ordering::SeqCst) >= (PINGS * 5) as u64,
+            "upstream got {} bytes, want {} (relay dropped one-way traffic)",
+            got.load(Ordering::SeqCst),
+            PINGS * 5
+        );
+
+        // Silence now: the relay must tear down within ~2x idle (client
+        // sees EOF from the queued FIN).
+        let quiet = std::time::Instant::now();
+        let res = tokio::time::timeout(Duration::from_secs(5), c.read_u8()).await;
+        let elapsed = quiet.elapsed();
+        handle.abort();
+        match res {
+            Err(_) => panic!("no teardown after silence"),
+            Ok(Ok(_)) => panic!("expected teardown, but read data instead"),
+            Ok(Err(_)) => {}
+        }
+        assert!(
+            elapsed <= Duration::from_millis(2 * 200 + 150),
+            "teardown took {elapsed:?} after silence, want <= ~550ms"
+        );
+    }
+
+    // Mirrors TestRelayEarlyClosingUpstreamDeliversDataAndCleanEOF: the
+    // upstream answers CONNECT, writes a payload and closes WITHOUT reading
+    // the client's request. The relay must still deliver the payload AND end
+    // with a clean FIN — closing with unread data queued and no FIN queued
+    // makes Linux answer RST, destroying data the peer has not read (the
+    // original curl exit 56 bug).
+    #[tokio::test]
+    async fn relay_early_closing_upstream_delivers_clean_eof() {
+        let payload = b"SAW:tcSMOKE123:9999\n".to_vec();
+        let up = early_close_upstream(&payload).await.unwrap();
+        let (addr, _srv, handle) = start_proxy(&[(b"www.example.com", b"tcSMOKE123")], &up).await;
+
+        let mut failures: Vec<String> = Vec::new();
+        for i in 0..200 {
+            let mut c = socks_connect(&addr, b"www.example.com", 9999).await;
+            // The client sends its GET the moment the success reply lands;
+            // the upstream is already writing its payload and closing.
+            c.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+            let mut buf = Vec::new();
+            match tokio::time::timeout(Duration::from_secs(2), c.read_to_end(&mut buf)).await {
+                Err(_) => failures.push(format!("iteration {}: read timed out", i + 1)),
+                Ok(Err(e)) => failures.push(format!(
+                    "iteration {}: read error after {} bytes: {e} (want clean EOF)",
+                    i + 1,
+                    buf.len()
+                )),
+                Ok(Ok(_)) => {
+                    if buf != payload {
+                        failures.push(format!(
+                            "iteration {}: got {:?}, want {:?}",
+                            i + 1,
+                            buf,
+                            payload
+                        ));
+                    }
+                }
+            }
+        }
+        handle.abort();
+        assert!(
+            failures.is_empty(),
+            "{}/200 iterations failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    // Mirrors TestUpstreamConnectUsesDomainATYP: capture the exact bytes the
+    // proxy sends upstream; domains must go as ATYP 0x03 (socks5h).
+    #[tokio::test]
+    async fn upstream_connect_uses_domain_atyp() {
+        let (up, mut captured) = capture_upstream(3 + 4 + 1 + "tcXYZabc123".len() + 2)
+            .await
+            .unwrap();
+        let mut up_conn = TcpStream::connect(&up).await.unwrap();
+        // The capture never sends the final reply, so upstream_connect ends
+        // with an error once the capture side is dropped — the request bytes
+        // are already captured and asserted below.
+        let _ = crate::proxy::upstream_connect(&mut up_conn, b"tcXYZabc123", 443).await;
+        drop(up_conn);
+        let got = tokio::time::timeout(Duration::from_secs(2), captured.recv())
+            .await
+            .expect("no request captured")
+            .unwrap();
+        assert_eq!(&got[..3], &[0x05, 0x01, 0x00], "bad greeting bytes");
+        let mut want = vec![0x05, 0x01, 0x00, 0x03, "tcXYZabc123".len() as u8];
+        want.extend_from_slice(b"tcXYZabc123");
+        want.extend_from_slice(&443u16.to_be_bytes());
+        assert_eq!(&got[3..], &want[..], "request bytes differ");
+    }
+
+    // Mirrors TestSocks5ProxyForwardsIPv6AsATYP4: the upstream must receive
+    // ATYP 4 plus the raw 16 address bytes and the port.
+    #[tokio::test]
+    async fn forwards_ipv6_as_atyp4() {
+        let (up, mut captured) = capture_upstream(3 + 4 + 16 + 2).await.unwrap();
+        let (addr, _srv, handle) = start_proxy(&[], &up).await;
+
+        let mut c = TcpStream::connect(&addr).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut rep = [0u8; 2];
+        c.read_exact(&mut rep).await.unwrap();
+        let ip: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut req = vec![0x05, 0x01, 0x00, 0x04];
+        req.extend_from_slice(&ip.octets());
+        req.extend_from_slice(&443u16.to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        drop(c);
+        handle.abort();
+
+        let got = tokio::time::timeout(Duration::from_secs(2), captured.recv())
+            .await
+            .expect("no request captured")
+            .unwrap();
+        assert_eq!(got[6], 0x04, "upstream ATYP = {:#x}, want 0x04", got[6]);
+        assert_eq!(&got[7..23], &ip.octets()[..], "upstream addr bytes");
+        assert_eq!(&got[23..25], &[0x01, 0xBB], "upstream port bytes (443)");
+    }
+
+    // Mirrors TestSocks5ProxyUpstreamDialFailureRepliesFail: unreachable
+    // upstream -> generic failure reply to the client.
+    #[tokio::test]
+    async fn upstream_dial_failure_replies_fail() {
+        let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = ln.local_addr().unwrap().to_string();
+        drop(ln); // nothing is listening there anymore
+
+        let (addr, _srv, handle) = start_proxy(&[], &closed).await;
+        let mut c = TcpStream::connect(&addr).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut rep = [0u8; 2];
+        c.read_exact(&mut rep).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x00, 0x03, 3, b'a', b'b', b'c', 0x00, 0x50])
+            .await
+            .unwrap();
+        let mut head = [0u8; 10];
+        c.read_exact(&mut head).await.unwrap();
+        handle.abort();
+        assert_eq!(&head, &SOCKS_FAIL_REPLY, "want generic failure reply");
+    }
+
+    // Mirrors TestSocks5ProxyUpstreamRefusalRepliesFail: a reachable upstream
+    // that rejects the CONNECT also produces the generic failure reply.
+    #[tokio::test]
+    async fn upstream_refusal_replies_fail() {
+        let up = refuse_upstream().await.unwrap();
+        let (addr, _srv, handle) = start_proxy(&[], &up).await;
+        let mut c = TcpStream::connect(&addr).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut rep = [0u8; 2];
+        c.read_exact(&mut rep).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50])
+            .await
+            .unwrap();
+        let mut head = [0u8; 10];
+        c.read_exact(&mut head).await.unwrap();
+        handle.abort();
+        assert_eq!(&head, &SOCKS_FAIL_REPLY, "want generic failure reply");
     }
 }
