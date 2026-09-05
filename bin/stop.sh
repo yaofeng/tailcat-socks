@@ -15,19 +15,28 @@ case "$IMPL" in
   *)      echo "usage: $0 [go|python]" >&2; exit 2 ;;
 esac
 
+# Only signal a pid that really is a tailcat-dns-proxy: a pid file can outlive
+# a reboot and land on an unrelated process.
+is_ours() {
+  local cmdline
+  cmdline="$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null || true)"
+  [[ "$cmdline" == *tailcat-dns-proxy* || "$cmdline" == *tailcat_dns_proxy.py* ]]
+}
+
 STOPPED=0
 for PID_FILE in "${PID_FILES[@]}"; do
   [[ -f "$PID_FILE" ]] || continue
-  STOPPED=1
   PID="$(cat "$PID_FILE")"
-  if ! kill -0 "$PID" 2>/dev/null; then
-    echo "stale pid file $PID_FILE (pid $PID not alive); removing"
+  if ! kill -0 "$PID" 2>/dev/null || ! is_ours "$PID"; then
+    echo "stale pid file $PID_FILE (pid $PID not alive or not ours); removing"
     rm -f "$PID_FILE"
     continue
   fi
+  STOPPED=1
   echo "stopping pid $PID ..."
   kill -TERM "$PID" 2>/dev/null || true
-  for _ in $(seq 1 20); do
+  # 8s > the proxy's own 5s child-escalation so it can finish cleaning up.
+  for _ in $(seq 1 32); do
     kill -0 "$PID" 2>/dev/null || break
     sleep 0.25
   done

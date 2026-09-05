@@ -4,10 +4,17 @@
 # Config via env (all optional):
 #   LISTEN=127.0.0.1:1080  DNS_FILE=<root>/dns.txt  UPSTREAM=127.0.0.1:0
 #   TAILCAT_BIN=tailcat    PROXY_ARGS="extra flags"
+# PROXY_ARGS is word-split and glob-expanded by the shell (intended for
+# multiple flags); avoid spaces inside individual flag values.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="$ROOT/run"
+
+if [[ $# -gt 1 ]]; then
+  echo "usage: $0 [go|python]" >&2
+  exit 2
+fi
 
 IMPL="${1:-go}"
 case "$IMPL" in
@@ -53,6 +60,16 @@ if [[ "$IMPL" == go ]]; then
 else
   nohup python3 -u "$SRC" "${ARGS[@]}" ${PROXY_ARGS:-} >>"$LOG_FILE" 2>&1 &
 fi
-echo $! > "$PID_FILE"
+PID=$!
+echo "$PID" > "$PID_FILE"
 
-echo "started [$IMPL] pid $(cat "$PID_FILE")  listen=$LISTEN  log=$LOG_FILE"
+# Bail out loudly if the proxy died immediately (bad --dns-file, port in use).
+sleep 0.4
+if ! kill -0 "$PID" 2>/dev/null; then
+  echo "proxy [$IMPL] exited immediately (pid $PID); last log lines:" >&2
+  tail -5 "$LOG_FILE" >&2 || true
+  rm -f "$PID_FILE"
+  exit 1
+fi
+
+echo "started [$IMPL] pid $PID  listen=$LISTEN  log=$LOG_FILE"
