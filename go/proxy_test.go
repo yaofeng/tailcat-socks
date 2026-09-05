@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -389,6 +391,95 @@ func TestRelayIdleClockIsSharedAcrossDirections(t *testing.T) {
 	}
 	if elapsed := time.Since(quiet); elapsed > 2*200*time.Millisecond+150*time.Millisecond {
 		t.Errorf("teardown took %v after silence, want <= ~2x idle (550ms)", elapsed)
+	}
+}
+
+// earlyCloseUpstream is the e2e-smoke fake upstream: it completes the SOCKS5
+// handshake, writes one short payload and closes WITHOUT ever reading anything
+// the client sends after the handshake (curl's HTTP GET with --http0.9).
+func earlyCloseUpstream(t *testing.T, payload []byte) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			func() {
+				defer conn.Close()
+				hdr := make([]byte, 2)
+				io.ReadFull(conn, hdr)
+				io.ReadFull(conn, make([]byte, hdr[1]))
+				conn.Write([]byte{0x05, 0x00})
+				req := make([]byte, 4)
+				io.ReadFull(conn, req)
+				skip := 0
+				switch req[3] {
+				case 0x03:
+					l := make([]byte, 1)
+					io.ReadFull(conn, l)
+					skip = int(l[0])
+				case 0x01:
+					skip = 4
+				case 0x04:
+					skip = 16
+				}
+				io.ReadFull(conn, make([]byte, skip+2))
+				conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+				conn.Write(payload)
+				// ...and close without reading the client's request bytes.
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestRelayEarlyClosingUpstreamDeliversDataAndCleanEOF pins the e2e-smoke
+// failure: an upstream that answers the CONNECT and closes without reading the
+// client's request. The client (curl) has already sent its GET by then, so the
+// relay must still deliver the payload AND end the session with a clean FIN —
+// closing the client socket while those request bytes are still unread in our
+// receive queue makes Linux answer with RST instead, which destroys data curl
+// has not read yet (curl exit 56, empty body).
+func TestRelayEarlyClosingUpstreamDeliversDataAndCleanEOF(t *testing.T) {
+	payload := []byte("SAW:tcSMOKE123:9999\n")
+	up := earlyCloseUpstream(t, payload)
+	srv := startProxy(t, map[string]string{"www.example.com": "tcSMOKE123"}, up)
+
+	const iterations = 200
+	var failures []string
+	for i := 0; i < iterations; i++ {
+		c := socksConnect(t, srv.ActualAddr().String(), "www.example.com", 9999)
+		// curl sends its GET the moment the SOCKS5 success reply lands; the
+		// upstream is already writing its payload and closing.
+		c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		c.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
+
+		var buf []byte
+		one := make([]byte, 256)
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			n, err := c.Read(one)
+			buf = append(buf, one[:n]...)
+			if err != nil {
+				if err != io.EOF {
+					failures = append(failures, fmt.Sprintf("iteration %d: read after %d bytes: %v (want clean EOF)", i+1, len(buf), err))
+				}
+				break
+			}
+		}
+		c.Close()
+		if !bytes.Equal(buf, payload) {
+			failures = append(failures, fmt.Sprintf("iteration %d: got %q, want %q", i+1, buf, payload))
+		}
+	}
+	if len(failures) > 0 {
+		t.Fatalf("%d/%d iterations failed:\n%s", len(failures), iterations, strings.Join(failures, "\n"))
 	}
 }
 

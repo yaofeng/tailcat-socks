@@ -238,10 +238,34 @@ func relay(client, upstream net.Conn, idle time.Duration) {
 	go func() { copyWithIdleTimeout(upstream, client, idle, &clock); done <- struct{}{} }()
 	go func() { copyWithIdleTimeout(client, upstream, idle, &clock); done <- struct{}{} }()
 	<-done
-	// one direction finished: close both so the other unblocks
+	// One direction finished (EOF, error or idle timeout). The peer's socket
+	// may still hold unread bytes in our kernel receive queue; a plain Close
+	// there makes Linux send RST instead of FIN (tcp_close: data_was_unread),
+	// which destroys data the other side has not read yet. Python's _relay
+	// instead does shutdown(SHUT_RDWR) on both sockets, which emits FIN (and
+	// drops queued bytes without RST), and only then closes. Mirror that:
+	// half-close both ends and only then close the descriptors. The Close
+	// stays before the final reap so a copy direction stuck writing to a
+	// stalled peer is still unblocked, exactly as before the fix.
+	halfClose(client)
+	halfClose(upstream)
 	client.Close()
 	upstream.Close()
 	<-done
+}
+
+// halfClose is the Go equivalent of shutdown(fd, SHUT_RDWR): CloseWrite sends
+// FIN (never RST), CloseRead switches the receive side to drop-all so a later
+// Close cannot trip tcp_close's unread-data RST. Errors are ignored on
+// purpose, like Python's `except OSError: pass` around the shutdowns. Non-TCP
+// conns have no such half-close; leave them for Close.
+func halfClose(conn net.Conn) {
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	tc.CloseWrite() // FIN to the peer, like shutdown(SHUT_WR)
+	tc.CloseRead()  // stop caring about further input, like shutdown(SHUT_RD)
 }
 
 // copyWithIdleTimeout copies src to dst, giving up if no data arrives from
