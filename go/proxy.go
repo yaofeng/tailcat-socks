@@ -254,9 +254,13 @@ func relay(client, upstream net.Conn, idle time.Duration) {
 	<-done
 }
 
-// halfClose is the Go equivalent of shutdown(fd, SHUT_RDWR): CloseWrite sends
-// FIN (never RST), CloseRead switches the receive side to drop-all so a later
-// Close cannot trip tcp_close's unread-data RST. Errors are ignored on
+// halfClose is the Go equivalent of shutdown(fd, SHUT_RDWR). The anti-RST
+// property comes from CloseWrite: once FIN is queued, tcp_close no longer
+// treats queued unread data as "the peer still wants it", so Close ends in
+// FIN instead of RST. (CloseRead alone does not give that guarantee; this was
+// verified empirically.) CloseRead mirrors Python's shutdown(SHUT_RD) — it
+// drops further input, at the same cost Python pays: data the peer sends in
+// the window before Close earns the peer an RST. Errors are ignored on
 // purpose, like Python's `except OSError: pass` around the shutdowns. Non-TCP
 // conns have no such half-close; leave them for Close.
 func halfClose(conn net.Conn) {
