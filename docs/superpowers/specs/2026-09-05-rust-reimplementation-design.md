@@ -106,7 +106,7 @@ libc       = "0.2"    # 仅 unix：向 tailcat 子进程发 SIGTERM（tokio 只�
 ## README / 文档更新
 
 - 目录结构加 `rust/` 树；仓库描述改为「三个行为一致的实现」。
-- 安装依赖加 Rust 1.75+（构建用；或直接用已构建二进制）。
+- 安装依赖加 Rust 1.85+（构建用；或直接用已构建二进制）。
 - 快速开始加 `cd rust && cargo build --release && …` 与 `bin/start.sh rust`。
 - 测试节加 `cd rust && cargo test`。
 - Docker 节明确标注镜像仍基于 Go 版构建。
