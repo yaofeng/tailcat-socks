@@ -6,3 +6,4 @@ pub mod config;
 pub mod dnsmap;
 pub mod error;
 pub mod logging;
+pub mod proxy;
