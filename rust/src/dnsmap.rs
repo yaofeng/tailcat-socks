@@ -48,8 +48,10 @@ pub fn load_dns_file(path: &Path) -> Result<Mapping, DnsFileError> {
 }
 
 /// domain->token mapping, hot-swappable atomically (Go's atomic.Value).
+/// Cheaply clonable: all handles share one ArcSwap cell.
+#[derive(Clone)]
 pub struct DnsMap {
-    map: ArcSwap<Mapping>,
+    map: std::sync::Arc<ArcSwap<Mapping>>,
 }
 
 impl Default for DnsMap {
@@ -61,7 +63,7 @@ impl Default for DnsMap {
 impl DnsMap {
     pub fn new() -> Self {
         Self {
-            map: ArcSwap::from_pointee(HashMap::new()),
+            map: std::sync::Arc::new(ArcSwap::from_pointee(HashMap::new())),
         }
     }
 
@@ -87,6 +89,63 @@ pub fn rewrite_host(host: &[u8], m: &Mapping) -> Vec<u8> {
 /// Distinct tokens in a mapping (for the startup log line).
 pub fn token_set(m: &Mapping) -> HashSet<&Vec<u8>> {
     m.values().collect()
+}
+
+/// Poll `path`'s mtime every `interval`; on change reload the mapping into
+/// `map`. Mirrors go/dnsmap.go WatchDNSFile, including two subtle details:
+/// - Stat BEFORE loading: a write landing between the two leaves last_mod at
+///   the older mtime, so the next tick reloads instead of swallowing it.
+/// - A failed initial load zeroes last_mod so every tick retries until the
+///   file becomes readable.
+pub async fn watch(
+    path: std::path::PathBuf,
+    map: DnsMap,
+    interval: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let mut last_mod: Option<std::time::SystemTime> = None;
+    if let Ok(meta) = fs::metadata(&path) {
+        last_mod = Some(meta.modified().unwrap_or(std::time::UNIX_EPOCH));
+    }
+    match load_dns_file(&path) {
+        Ok(first) => {
+            map.store(first);
+        }
+        Err(err) => {
+            last_mod = None; // retry the initial load on every tick
+            crate::logging::log_line(format!("initial load failed: {err}")); // err Display already includes path
+        }
+    }
+
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else { continue };
+        if last_mod.is_some_and(|lm| lm == mtime) {
+            continue;
+        }
+        match load_dns_file(&path) {
+            Err(err) => {
+                crate::logging::log_line(format!("reload failed ({err}); keeping previous map"));
+            }
+            Ok(new_map) => {
+                last_mod = Some(mtime);
+                let (domains, tokens) = (new_map.len(), token_set(&new_map).len());
+                map.store(new_map);
+                crate::logging::log_line(format!(
+                    "reloaded {}: {domains} domain(s) -> {tokens} token(s)",
+                    path.display()
+                ));
+            }
+        }
+    }
 }
 
 /// Test helper: build a Mapping from (domain, token) byte pairs.
@@ -196,5 +255,111 @@ tcGGG         bar.com\tbaz.com
             (b"c.com".as_slice(), b"tc2"),
         ]);
         assert_eq!(token_set(&m).len(), 2);
+    }
+
+    // Mirrors go/dnsmap_test.go TestWatchDNSFileReloads (50ms tick, mtime
+    // bumped explicitly for coarse-grained filesystems).
+    #[tokio::test]
+    async fn watch_reloads_on_mtime_change() {
+        let dir = std::env::temp_dir().join(format!("tcdns-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dns.txt");
+        std::fs::write(&path, b"tcA alpha.com\n").unwrap();
+
+        let map = DnsMap::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = tokio::spawn(watch(
+            path.clone(),
+            map.clone(),
+            std::time::Duration::from_millis(50),
+            cancel.clone(),
+        ));
+
+        // initial load
+        wait_for(|| map.load().contains_key(b"alpha.com".as_slice())).await;
+
+        // rewrite content; sleep first so the new mtime differs even on
+        // coarse-grained filesystems (Go's test forces it with os.Chtimes)
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        std::fs::write(&path, b"tcB beta.com\n").unwrap();
+        wait_for(|| map.load().contains_key(b"beta.com".as_slice())).await;
+        assert!(
+            !map.load().contains_key(b"alpha.com".as_slice()),
+            "removed domain gone after reload"
+        );
+
+        cancel.cancel();
+        handle.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Mirrors TestWatchDNSFileKeepsPreviousMapOnReadError: reads fail while
+    // stat still succeeds (file replaced by a directory) -> old map survives.
+    #[tokio::test]
+    async fn watch_keeps_previous_map_on_read_error() {
+        let dir = std::env::temp_dir().join(format!("tcdns-test-err-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dns.txt");
+        std::fs::write(&path, b"tcA keep.com\n").unwrap();
+
+        let map = DnsMap::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = tokio::spawn(watch(
+            path.clone(),
+            map.clone(),
+            std::time::Duration::from_millis(50),
+            cancel.clone(),
+        ));
+        wait_for(|| map.load().contains_key(b"keep.com".as_slice())).await;
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            map.load().get(b"keep.com".as_slice()).map(Vec::as_slice),
+            Some(b"tcA".as_slice()),
+            "read error must keep previous mapping"
+        );
+
+        cancel.cancel();
+        handle.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Spec 测试计划: 初次载入失败(文件尚不存在)时,每个 tick 重试直至成功。
+    #[tokio::test]
+    async fn watch_retries_failed_initial_load() {
+        let dir = std::env::temp_dir().join(format!("tcdns-test-init-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dns.txt"); // 故意不先创建
+
+        let map = DnsMap::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = tokio::spawn(watch(
+            path.clone(),
+            map.clone(),
+            std::time::Duration::from_millis(50),
+            cancel.clone(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(map.load().is_empty(), "file absent: map must stay empty");
+
+        std::fs::write(&path, b"tcLate late.com\n").unwrap();
+        wait_for(|| map.load().contains_key(b"late.com".as_slice())).await;
+
+        cancel.cancel();
+        handle.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn wait_for(cond: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("condition not met within timeout");
     }
 }
