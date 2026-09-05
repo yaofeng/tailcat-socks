@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start tailcat-dns-proxy in the background.
-# Usage: bin/start.sh [go|python]    (default: go)
+# Usage: bin/start.sh [go|python|rust]    (default: go)
 # Config via env (all optional):
 #   LISTEN=127.0.0.1:1080  DNS_FILE=<root>/dns.txt  UPSTREAM=127.0.0.1:0
 #   TAILCAT_BIN=tailcat    PROXY_ARGS="extra flags"
@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="$ROOT/run"
 
 if [[ $# -gt 1 ]]; then
-  echo "usage: $0 [go|python]" >&2
+  echo "usage: $0 [go|python|rust]" >&2
   exit 2
 fi
 
@@ -28,8 +28,13 @@ case "$IMPL" in
     PID_FILE="$RUN_DIR/tailcat-dns-proxy-python.pid"
     LOG_FILE="$RUN_DIR/tailcat-dns-proxy-python.log"
     ;;
+  rust)
+    BIN="$ROOT/rust/target/release/tailcat-dns-proxy"
+    PID_FILE="$RUN_DIR/tailcat-dns-proxy-rust.pid"
+    LOG_FILE="$RUN_DIR/tailcat-dns-proxy-rust.log"
+    ;;
   *)
-    echo "usage: $0 [go|python]" >&2
+    echo "usage: $0 [go|python|rust]" >&2
     exit 2
     ;;
 esac
@@ -62,16 +67,27 @@ if [[ -f "$PID_FILE" ]]; then
   rm -f "$PID_FILE"
 fi
 
-# Build the Go proxy if the binary is missing (requires a Go toolchain).
+# Build the proxy if the binary is missing (requires the toolchain).
 if [[ "$IMPL" == go && ! -x "$BIN" ]]; then
   echo "go binary missing; building (go build)..."
   (cd "$ROOT/go" && go build -o bin/tailcat-dns-proxy .)
+fi
+if [[ "$IMPL" == rust && ! -x "$BIN" ]]; then
+  echo "rust binary missing; building (cargo build --release)..."
+  if command -v cargo >/dev/null 2>&1; then
+    (cd "$ROOT/rust" && cargo build --release)
+  elif [[ -f "$HOME/.cargo/env" ]]; then
+    (source "$HOME/.cargo/env" && cd "$ROOT/rust" && cargo build --release)
+  else
+    echo "cargo not found (install via https://rustup.rs)" >&2
+    exit 1
+  fi
 fi
 
 : > "$LOG_FILE"   # truncate on each fresh start
 
 ARGS=(--listen "$LISTEN" --dns-file "$DNS_FILE" --upstream "$UPSTREAM" --tailcat-bin "$TAILCAT_BIN")
-if [[ "$IMPL" == go ]]; then
+if [[ "$IMPL" != python ]]; then
   nohup "$BIN" "${ARGS[@]}" ${PROXY_ARGS:-} >>"$LOG_FILE" 2>&1 &
 else
   nohup python3 -u "$SRC" "${ARGS[@]}" ${PROXY_ARGS:-} >>"$LOG_FILE" 2>&1 &

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stop tailcat-dns-proxy (and its auto-launched tailcat socks child, which
 # the proxy terminates on SIGTERM via its signal handler).
-# Usage: bin/stop.sh [go|python]   (no arg = stop both)
+# Usage: bin/stop.sh [go|python|rust]   (no arg = stop all)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,10 +9,11 @@ RUN_DIR="$ROOT/run"
 
 IMPL="${1:-}"
 case "$IMPL" in
-  "")     PID_FILES=("$RUN_DIR/tailcat-dns-proxy-go.pid" "$RUN_DIR/tailcat-dns-proxy-python.pid") ;;
+  "")     PID_FILES=("$RUN_DIR/tailcat-dns-proxy-go.pid" "$RUN_DIR/tailcat-dns-proxy-python.pid" "$RUN_DIR/tailcat-dns-proxy-rust.pid") ;;
   go)     PID_FILES=("$RUN_DIR/tailcat-dns-proxy-go.pid") ;;
   python) PID_FILES=("$RUN_DIR/tailcat-dns-proxy-python.pid") ;;
-  *)      echo "usage: $0 [go|python]" >&2; exit 2 ;;
+  rust)   PID_FILES=("$RUN_DIR/tailcat-dns-proxy-rust.pid") ;;
+  *)      echo "usage: $0 [go|python|rust]" >&2; exit 2 ;;
 esac
 
 # Only signal a pid that really is a tailcat-dns-proxy: a pid file can outlive

@@ -4,7 +4,7 @@
 
 你只需对一个固定的 SOCKS5 端口说人话域名,无需记 `tcXYZabc123...` 这种 token,也无需手动起 tailcat。
 
-本仓库包含行为一致的**两个实现**:`python/`(原版,纯标准库)与 `go/`(Go 复刻版,零第三方依赖,单静态二进制)。Docker 镜像基于 Go 版构建。
+本仓库包含行为一致的**三个实现**:`python/`(原版,纯标准库)、`go/`(零第三方依赖,单静态二进制)与 `rust/`(tokio 生态)。Docker 镜像基于 Go 版构建。
 
 ## 它做什么
 
@@ -45,6 +45,7 @@ tcoAbCdEf789     www.example.com
 
 - Go 版:Go 1.23+(构建用;或直接用已构建的 `go/bin/tailcat-dns-proxy`)
 - Python 版:Python 3.8+(仅标准库)
+- Rust 版:Rust 1.75+(构建用;或直接用已构建的 `rust/target/release/tailcat-dns-proxy`)
 - `tailcat`:https://github.com/tailscale/tailcat(`brew install tailcat` 或 `go install github.com/tailscale/tailcat/cmd/tailcat@latest`;注意 tailcat@latest 需要 Go 1.27+ 工具链)
 
 ## 快速开始(裸机)
@@ -59,10 +60,14 @@ cp dns.txt.example dns.txt && $EDITOR dns.txt
 cd go && go build -o bin/tailcat-dns-proxy . && cd ..
 go/bin/tailcat-dns-proxy
 
+# Rust 版(推荐:先构建一次)
+cd rust && cargo build --release && cd ..
+rust/target/release/tailcat-dns-proxy
+
 # Python 版
 python3 python/tailcat_dns_proxy.py
 
-# 指定各参数(两版本参数同名同默认,下以 Go 版为例)
+# 指定各参数(三版本参数同名同默认,下以 Go 版为例)
 go/bin/tailcat-dns-proxy \
     --listen 127.0.0.1:1080 \
     --dns-file dns.txt \
@@ -88,14 +93,17 @@ export all_proxy=socks5h://127.0.0.1:1080
 
 ## 启停脚本(bin/)
 
-后台运行,`run/` 下按版本维护 pid 与 log(`run/tailcat-dns-proxy-{go,python}.{pid,log}`):
+后台运行,`run/` 下按版本维护 pid 与 log(`run/tailcat-dns-proxy-{go,python,rust}.{pid,log}`):
 
 ```bash
 bin/start.sh          # 后台启动 Go 版(缺二进制时自动 go build)
 bin/start.sh python   # 后台启动 Python 版
-bin/stop.sh           # 停止(不带参数停两个版本;bin/stop.sh go 只停 Go 版)
-bin/restart.sh        # 无参数 = 停两版 + 启 Go 版;bin/restart.sh python 重启 Python 版
-tail -f run/tailcat-dns-proxy-go.log      # 或 ...-python.log
+bin/start.sh rust     # 后台启动 Rust 版
+bin/stop.sh           # 停止(不带参数停全部版本;bin/stop.sh go 只停 Go 版)
+bin/stop.sh rust      # 只停 Rust 版
+bin/restart.sh        # 无参数 = 停全部 + 启 Go 版;bin/restart.sh python 重启 Python 版
+bin/restart.sh rust   # 重启 Rust 版
+tail -f run/tailcat-dns-proxy-go.log      # 或 ...-python.log / ...-rust.log
 ```
 
 脚本只停止确属本代理的进程(校验 /proc pid 归属);start 后若进程秒退(如 dns 文件不存在、端口被占)会直接报错并以非零码退出,并打印日志尾部。
@@ -140,7 +148,12 @@ tailcat-dns-proxy/
 │   ├── *_test.go                     # go test 单元 + 端到端
 │   ├── testdata/fake-tailcat/        # 测试用假 tailcat
 │   └── bin/                          # 构建产物(gitignore)
-├── bin/{start,stop,restart}.sh       # 裸机后台启停(支持 go|python)
+├── rust/                             # Rust 复刻版(tokio 生态)
+│   ├── Cargo.toml
+│   ├── src/{main,lib,config,dnsmap,proxy,tailcat,error,logging}.rs
+│   ├── src/bin/fake-tailcat.rs       # 测试用假 tailcat
+│   └── tests/{e2e,autolaunch,waitready_deadport}.rs
+├── bin/{start,stop,restart}.sh       # 裸机后台启停(支持 go|python|rust)
 ├── docker/{Dockerfile,docker-compose.yml}
 ├── docs/superpowers/                 # 设计文档与实现计划
 ├── dns.txt                           # 域名→token 映射(运行时热加载)
@@ -152,10 +165,13 @@ tailcat-dns-proxy/
 - **支持**: SOCKS5 `CONNECT`;IPv4/IPv6/域名 ATYP;无认证握手;未命中域名透传;多线程并发;tailcat 子进程自动拉起/回收;dns.txt 热加载。
 - **不支持**(YAGNI): `UDP ASSOCIATE` / `BIND`(返回失败);用户名/密码认证;跨进程共享映射。
 
+三个实现行为一致;Docker 镜像仍基于 Go 版构建。
+
 ## 测试
 
 ```bash
 cd go && go test ./...              # Go 版:解析/改写/热加载/端到端
 python3 -m pytest python/tests -v   # Python 版
+cd rust && cargo test               # Rust 版:解析/改写/热加载/端到端
 ```
 覆盖 dns.txt 解析、大小写改写、未命中透传、热加载、空闲超时,以及经假上游/假 tailcat 的端到端 host 改写。

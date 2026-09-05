@@ -17,13 +17,15 @@ tailcat-socks/
 ├── rust/
 │   ├── Cargo.toml
 │   ├── src/
-│   │   ├── main.rs        # 装配与生命周期：启动顺序、信号、tailcat 拉起/回收、wait_ready
-│   │   ├── config.rs      # clap derive 的 Config + parse_addr + free_high_port
-│   │   ├── dnsmap.rs      # DnsMap（ArcSwap）+ load_dns_file + watch 任务
-│   │   ├── proxy.rs       # Server：SOCKS5 服务端 / 上游客户端握手 / relay
+│   │   ├── main.rs        # bin 目标：装配与生命周期
+│   │   ├── lib.rs         # 库目标：模块出口（集成测试经它访问内部）
+│   │   ├── config.rs      # clap derive 的 Config + parse_addr/free_high_port
+│   │   ├── dnsmap.rs      # DnsMap（ArcSwap）+ load_dns_file + watch
+│   │   ├── proxy.rs       # Server / SOCKS5 服务端 / 上游握手 / relay
+│   │   ├── tailcat.rs     # spawn_socks / wait_ready / terminate
 │   │   ├── error.rs       # thiserror 错误类型
-│   │   └── bin/
-│   │       └── fake-tailcat.rs  # 测试用假 tailcat（cargo 自动构建，见测试节）
+│   │   ├── logging.rs     # [tailcat-dns-proxy] 前缀日志
+│   │   └── bin/fake-tailcat.rs  # 测试用假 tailcat（cargo bin 目标）
 │   └── tests/               # 集成测试（e2e / dnsmap 热加载 / relay 专项 / 自动拉起）
 ├── bin/{start,stop,restart}.sh   # 增加 rust 选项
 └── (其余不变)
@@ -31,7 +33,7 @@ tailcat-socks/
 
 构建产物在 `rust/target/`（根 `.gitignore` 追加）。
 
-## 依赖清单（Cargo.toml 直接依赖，7 个）
+## 依赖清单（Cargo.toml 直接依赖，6 个）
 
 ```toml
 tokio      = { version = "1", features = ["rt-multi-thread", "net", "process", "signal", "time", "macros", "io-util"] }
@@ -39,9 +41,10 @@ clap       = { version = "4", features = ["derive"] }
 arc-swap   = "1"
 tokio-util = "0.7"                         # CancellationToken
 thiserror  = "2"
-anyhow     = "1"
 libc       = "0.2"    # 仅 unix：向 tailcat 子进程发 SIGTERM（tokio 只提供 SIGKILL）
 ```
+
+（anyhow 在规划期移除：main 的错误路径都是「打日志 + 退出码」，无错误冒泡需求。）
 
 选型理由：tokio+clap 是生态中被最广泛审计的组合；`TcpStream::shutdown` std 自带，半关无需额外 crate；随机端口读 `/dev/urandom`，不引 rand。
 
