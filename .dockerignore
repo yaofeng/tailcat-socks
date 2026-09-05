@@ -1,0 +1,6 @@
+.git
+run/
+go/bin/
+go/testdata/
+python/__pycache__/
+dns.txt
