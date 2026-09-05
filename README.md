@@ -4,6 +4,8 @@
 
 你只需对一个固定的 SOCKS5 端口说人话域名,无需记 `tcXYZabc123...` 这种 token,也无需手动起 tailcat。
 
+本仓库包含行为一致的**两个实现**:`python/`(原版,纯标准库)与 `go/`(Go 复刻版,零第三方依赖,单静态二进制)。Docker 镜像基于 Go 版构建。
+
 ## 它做什么
 
 ```
@@ -20,7 +22,7 @@ curl http://www.example.com:8888/health
 
 关键设计:
 - **token 只存在于 `dns.txt` 和代理内部**,从不进 URL。curl 会小写化 URL 主机名,但本设计里 curl 看到的是你给的小写域名,代理换成 `dns.txt` 里大小写混合的真实 token —— 恰好绕开 curl/浏览器小写化 token 的问题。
-- **一个上游服务所有 token**。`tailcat socks` 独立运行时按每个 CONNECT 的主机名路由:主机名是合法 `tc` 地址就直接打洞到那台机器,不依赖命令行参数。所以 Python 代理只需拉起一个固定的 `tailcat socks`,把改写后的 token 当主机名丢过去即可,无需为每个 token 各起一个。
+- **一个上游服务所有 token**。`tailcat socks` 独立运行时按每个 CONNECT 的主机名路由:主机名是合法 `tc` 地址就直接打洞到那台机器,不依赖命令行参数。所以代理只需拉起一个固定的 `tailcat socks`,把改写后的 token 当主机名丢过去即可,无需为每个 token 各起一个。
 - **`tailcat socks` 自动拉起、自动回收**。代理启动时 spawn 子进程,端口就绪后才开始服务;收到 SIGINT/SIGTERM 或退出时回收子进程,不留孤儿。
 
 ## dns.txt 格式
@@ -41,8 +43,9 @@ tcoAbCdEf789     www.example.com
 
 ## 安装依赖
 
-- Python 3.8+(仅标准库,无第三方依赖)
-- `tailcat`:https://github.com/tailscale/tailcat(`brew install tailcat` 或 `go install github.com/tailscale/tailcat/cmd/tailcat@latest`)
+- Go 版:Go 1.23+(构建用;或直接用已构建的 `go/bin/tailcat-dns-proxy`)
+- Python 版:Python 3.8+(仅标准库)
+- `tailcat`:https://github.com/tailscale/tailcat(`brew install tailcat` 或 `go install github.com/tailscale/tailcat/cmd/tailcat@latest`;注意 tailcat@latest 需要 Go 1.27+ 工具链)
 
 ## 快速开始(裸机)
 
@@ -51,10 +54,16 @@ tcoAbCdEf789     www.example.com
 cp dns.txt.example dns.txt && $EDITOR dns.txt
 
 # 前台运行(默认: 监听 127.0.0.1:1080, dns.txt 在仓库根, tailcat socks 用随机高位端口)
-python3 src/tailcat_dns_proxy.py
 
-# 指定各参数
-python3 src/tailcat_dns_proxy.py \
+# Go 版(推荐:先构建一次)
+cd go && go build -o bin/tailcat-dns-proxy . && cd ..
+go/bin/tailcat-dns-proxy
+
+# Python 版
+python3 python/tailcat_dns_proxy.py
+
+# 指定各参数(两版本参数同名同默认,下以 Go 版为例)
+go/bin/tailcat-dns-proxy \
     --listen 127.0.0.1:1080 \
     --dns-file dns.txt \
     --upstream 127.0.0.1:1081 \
@@ -79,16 +88,19 @@ export all_proxy=socks5h://127.0.0.1:1080
 
 ## 启停脚本(bin/)
 
-后台运行,`run/` 下维护 pid 与 log:
+后台运行,`run/` 下按版本维护 pid 与 log(`run/tailcat-dns-proxy-{go,python}.{pid,log}`):
 
 ```bash
-bin/start.sh      # 后台启动
-bin/stop.sh       # 停止(回收 tailcat 子进程)
-bin/restart.sh    # 重启
-tail -f run/tailcat-dns-proxy.log
+bin/start.sh          # 后台启动 Go 版(缺二进制时自动 go build)
+bin/start.sh python   # 后台启动 Python 版
+bin/stop.sh           # 停止(不带参数停两个版本;bin/stop.sh go 只停 Go 版)
+bin/restart.sh        # 无参数 = 停两版 + 启 Go 版;bin/restart.sh python 重启 Python 版
+tail -f run/tailcat-dns-proxy-go.log      # 或 ...-python.log
 ```
 
-配置用环境变量(可选):`LISTEN`、`DNS_FILE`、`UPSTREAM`、`TAILCAT_BIN`、`PROXY_ARGS`。
+脚本只停止确属本代理的进程(校验 /proc pid 归属);start 后若进程秒退(如 dns 文件不存在、端口被占)会直接报错并以非零码退出,并打印日志尾部。
+
+配置用环境变量(可选):`LISTEN`、`DNS_FILE`、`UPSTREAM`、`TAILCAT_BIN`、`PROXY_ARGS`(会经 shell 分词,适合放多个额外 flag)。
 例:`LISTEN=127.0.0.1:1080 UPSTREAM=127.0.0.1:1081 bin/start.sh`
 
 ## Docker
@@ -103,6 +115,8 @@ docker compose down
 - compose 把仓库根目录只读挂进容器 `/app/config`,`DNS_FILE=/app/config/dns.txt`。改宿主机 `dns.txt` 即热加载(挂目录而非单文件,规避编辑器 rename 换 inode 导致的热加载失效)。
 - 容器内 `LISTEN=0.0.0.0:1080`,tailcat socks 仍用内部随机高位端口。宿主机经 `1080:1080` 访问。
 - 容器需能出网(DERP/STUN)。
+- 镜像 runtime 为 `debian:bookworm-slim`,内含 Go 静态编译的代理二进制与 tailcat,不再依赖 Python。
+- 手动构建(等价于 compose):在仓库根目录 `docker build -f docker/Dockerfile -t tailcat-dns-proxy .`——context 必须是仓库根,不要写成 `-f docker/Dockerfile ..`(那会把父目录当 context)。
 
 ## dns.txt 热加载
 
@@ -115,13 +129,22 @@ docker compose down
 ## 目录结构
 
 ```
-tailproxy/
-├── src/tailcat_dns_proxy.py      # 代理主体(纯标准库)
-├── tests/test_tailcat_dns_proxy.py
-├── bin/{start,stop,restart}.sh   # 裸机后台启停
+tailcat-dns-proxy/
+├── python/
+│   ├── tailcat_dns_proxy.py          # Python 版代理主体(纯标准库)
+│   └── tests/test_tailcat_dns_proxy.py
+├── go/                               # Go 复刻版(行为一致)
+│   ├── main.go                       # flag / tailcat 自动拉起 / 信号
+│   ├── dnsmap.go                     # dns.txt 解析 + 原子热加载
+│   ├── proxy.go                      # SOCKS5 服务端 + 上游握手 + relay
+│   ├── *_test.go                     # go test 单元 + 端到端
+│   ├── testdata/fake-tailcat/        # 测试用假 tailcat
+│   └── bin/                          # 构建产物(gitignore)
+├── bin/{start,stop,restart}.sh       # 裸机后台启停(支持 go|python)
 ├── docker/{Dockerfile,docker-compose.yml}
-├── dns.txt                       # 域名→token 映射(运行时热加载)
-└── run/                          # pid + log(脚本生成)
+├── docs/superpowers/                 # 设计文档与实现计划
+├── dns.txt                           # 域名→token 映射(运行时热加载)
+└── run/                              # pid + log(脚本生成)
 ```
 
 ## 实现范围
@@ -132,6 +155,7 @@ tailproxy/
 ## 测试
 
 ```bash
-python3 tests/test_tailcat_dns_proxy.py     # 或 python3 -m pytest tests -v
+cd go && go test ./...              # Go 版:解析/改写/热加载/端到端
+python3 -m pytest python/tests -v   # Python 版
 ```
-覆盖 dns.txt 解析、大小写改写、未命中透传、热加载,以及经假上游的端到端 host 改写。
+覆盖 dns.txt 解析、大小写改写、未命中透传、热加载、空闲超时,以及经假上游/假 tailcat 的端到端 host 改写。
