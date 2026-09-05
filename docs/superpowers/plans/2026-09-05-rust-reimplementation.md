@@ -2043,9 +2043,12 @@ pub async fn spawn_socks(bin_path: &str, host: &str, port: u16) -> std::io::Resu
 pub async fn wait_ready(addr: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        // timeout() returns Result<io::Result<TcpStream>, Elapsed> — the
+        // inner Result is the connect itself; only Ok(Ok(_)) means ready
+        // (checked via is_ok_and, else connection-refused reads as ready).
         if tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr))
             .await
-            .is_ok()
+            .is_ok_and(|r| r.is_ok())
         {
             return true;
         }
