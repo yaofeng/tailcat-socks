@@ -3,5 +3,6 @@
 //! upstream. Rust implementation; see README.md for usage.
 
 pub mod config;
+pub mod dnsmap;
 pub mod error;
 pub mod logging;
