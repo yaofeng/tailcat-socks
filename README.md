@@ -115,7 +115,7 @@ docker compose down
 - compose 把仓库根目录只读挂进容器 `/app/config`,`DNS_FILE=/app/config/dns.txt`。改宿主机 `dns.txt` 即热加载(挂目录而非单文件,规避编辑器 rename 换 inode 导致的热加载失效)。
 - 容器内 `LISTEN=0.0.0.0:1080`,tailcat socks 仍用内部随机高位端口。宿主机经 `1080:1080` 访问。
 - 容器需能出网(DERP/STUN)。
-- 镜像 runtime 为 `debian:bookworm-slim`,内含 Go 静态编译的代理二进制与 tailcat,不再依赖 Python。
+- 镜像 runtime 为 `alpine:3.22`(全静态二进制不需要 glibc),内含 Go 静态编译的代理二进制与 tailcat,不再依赖 Python;已发布为 `yaofeng928/tailcat-socks:latest`。
 - 手动构建(等价于 compose):在仓库根目录 `docker build -f docker/Dockerfile -t tailcat-dns-proxy .`——context 必须是仓库根,不要写成 `-f docker/Dockerfile ..`(那会把父目录当 context)。
 
 ## dns.txt 热加载
