@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -261,6 +262,34 @@ func TestSocks5ProxyNoAcceptableMethod(t *testing.T) {
 	case got := <-received:
 		t.Errorf("upstream must not receive anything, got %q", got)
 	default:
+	}
+}
+
+// TestDialUpstreamReturnsTCPConnForHalfClose pins the conn-ownership
+// property the relay's FIN-first (anti-RST) teardown depends on: the conn
+// handed back by dialUpstream must be the raw *net.TCPConn (what halfClose
+// type-asserts), not a wrapper without CloseWrite/CloseRead. It also checks
+// the CONNECT reached the upstream as a parsed domain.
+func TestDialUpstreamReturnsTCPConnForHalfClose(t *testing.T) {
+	received := make(chan string, 1)
+	up := fakeUpstream(t, received)
+	srv := newProxy(t, map[string]string{}, up)
+
+	conn, err := srv.dialUpstream(context.Background(), "tcXYZabc123", 443)
+	if err != nil {
+		t.Fatalf("dialUpstream: %v", err)
+	}
+	defer conn.Close()
+	if _, ok := conn.(*net.TCPConn); !ok {
+		t.Fatalf("dialUpstream returned %T, want *net.TCPConn (halfClose would silently no-op)", conn)
+	}
+	select {
+	case got := <-received:
+		if want := net.JoinHostPort("tcXYZabc123", "443"); got != want {
+			t.Errorf("upstream saw %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream never received the CONNECT")
 	}
 }
 
@@ -529,10 +558,11 @@ func TestSocks5ProxyUpstreamDialFailureRepliesFail(t *testing.T) {
 }
 
 // TestSocks5ProxyOversizedTokenFailsConnect: a rewritten token longer than
-// the 255-byte SOCKS5 domain field must fail the CONNECT. The hand-rolled
-// upstream encoder wrapped the length byte (byte(300) == 44) and silently
-// shipped a truncated token upstream; x/net must reject the over-long FQDN
-// before any CONNECT byte reaches the upstream.
+// the 255-byte SOCKS5 domain field must fail the CONNECT. The old hand-rolled
+// encoder wrapped the length byte (byte(300) == 44) and silently shipped a
+// truncated token upstream; dialUpstream now encodes the CONNECT request
+// before dialing, so the over-long domain is rejected without even a TCP
+// connect to the upstream.
 func TestSocks5ProxyOversizedTokenFailsConnect(t *testing.T) {
 	received := make(chan string, 1)
 	up := fakeUpstream(t, received)

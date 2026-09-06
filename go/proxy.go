@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/net/proxy"
 )
 
 const (
@@ -33,9 +31,6 @@ type Server struct {
 	DNSMap       *DNSMap
 	UpstreamAddr string
 	ln           net.Listener
-	// upstream dials the chained SOCKS5 connection to the tailcat socks
-	// upstream (built in NewServer from UpstreamAddr).
-	upstream proxy.Dialer
 	// relayIdle is how long the relay tolerates silence in either direction
 	// before tearing the session down.
 	relayIdle time.Duration
@@ -44,15 +39,11 @@ type Server struct {
 // NewServer binds the listen address. Use ActualAddr for the resolved port
 // (listening on port 0 is useful in tests).
 func NewServer(dnsMap *DNSMap, upstreamAddr, listen string) (*Server, error) {
-	dialer, err := proxy.SOCKS5("tcp", upstreamAddr, nil, proxy.Direct)
-	if err != nil {
-		return nil, fmt.Errorf("build upstream dialer for %q: %w", upstreamAddr, err)
-	}
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return nil, err
 	}
-	return &Server{DNSMap: dnsMap, UpstreamAddr: upstreamAddr, ln: ln, upstream: dialer, relayIdle: relayIdleTimeout}, nil
+	return &Server{DNSMap: dnsMap, UpstreamAddr: upstreamAddr, ln: ln, relayIdle: relayIdleTimeout}, nil
 }
 
 // ActualAddr returns the bound address once NewServer has succeeded.
@@ -145,7 +136,7 @@ func (s *Server) serveConn(client net.Conn) {
 		socksFail(client)
 		return
 	}
-	up.SetDeadline(time.Time{}) // relay phase: shared idle timeout only (x/net applies the ctx deadline only during its handshake)
+	up.SetDeadline(time.Time{}) // relay phase: shared idle timeout only (dialUpstream hands back a deadline-free conn)
 
 	client.Write(socksOKReply)
 	relay(client, up, s.relayIdle)
@@ -187,13 +178,93 @@ func readATYPAddr(r io.Reader, atyp byte) (string, error) {
 
 // dialUpstream opens the chained SOCKS5 connection to the upstream, passing
 // host through as a domain (ATYP 0x03) when it is not an IP literal. The
-// x/net dialer bounds the whole dial+CONNECT exchange by ctx.
+// handshake is hand-rolled rather than using golang.org/x/net/proxy because
+// that dialer hands back an opaque conn wrapper without CloseWrite/CloseRead
+// (and not a *net.TCPConn), which would silently disable the relay's
+// FIN-first, anti-RST teardown on the upstream leg. The CONNECT request is
+// encoded before the TCP connect, so an over-long domain is rejected without
+// a single byte leaving here; the ctx deadline bounds the whole
+// dial+CONNECT exchange.
 func (s *Server) dialUpstream(ctx context.Context, host string, port uint16) (net.Conn, error) {
-	d, ok := s.upstream.(proxy.ContextDialer)
-	if !ok {
-		return nil, errors.New("upstream dialer does not support DialContext")
+	req, err := socksConnectRequest(host, port)
+	if err != nil {
+		return nil, fmt.Errorf("upstream CONNECT %s: %w", net.JoinHostPort(host, strconv.Itoa(int(port))), err)
 	}
-	return d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	d := &net.Dialer{}
+	conn, err := d.DialContext(ctx, "tcp", s.UpstreamAddr)
+	if err != nil {
+		return nil, fmt.Errorf("dial upstream %s: %w", s.UpstreamAddr, err)
+	}
+	if err := socksClientConnect(ctx, conn, req); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("upstream CONNECT %s: %w", net.JoinHostPort(host, strconv.Itoa(int(port))), err)
+	}
+	return conn, nil
+}
+
+// socksConnectRequest encodes a SOCKS5 CONNECT request for host:port: IPv4
+// and IPv6 literals go out as ATYP 0x01/0x04, anything else as a domain
+// (ATYP 0x03) so the upstream resolves it (socks5h semantics). A domain
+// longer than the 255-byte length field is rejected here — the old encoder
+// wrapped byte(len(host)) silently and shipped a truncated token upstream.
+func socksConnectRequest(host string, port uint16) ([]byte, error) {
+	var addr []byte
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			addr = append([]byte{0x01}, ip4...)
+		} else {
+			addr = append([]byte{0x04}, ip.To16()...)
+		}
+	} else {
+		if len(host) > 255 {
+			return nil, fmt.Errorf("target %q: FQDN too long", host)
+		}
+		addr = append([]byte{0x03, byte(len(host))}, host...)
+	}
+	return append(append([]byte{0x05, 0x01, 0x00}, addr...), byte(port>>8), byte(port)), nil
+}
+
+// socksClientConnect performs the greeting + CONNECT exchange on an already
+// dialed upstream conn using the pre-encoded request. The conn's deadline is
+// set from ctx for the handshake and cleared on success, so the relay phase
+// is governed by the shared idle clock alone. net.Conn.Write is
+// full-write-or-error by its io.Writer contract, so the err checks below are
+// also the short-write checks.
+func socksClientConnect(ctx context.Context, conn net.Conn, req []byte) error {
+	if dl, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(dl); err != nil {
+			return err
+		}
+	}
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return err
+	}
+	var greet [2]byte
+	if _, err := io.ReadFull(conn, greet[:]); err != nil {
+		return err
+	}
+	if greet[0] != 0x05 || greet[1] != 0x00 {
+		return errors.New("upstream refused the greeting")
+	}
+	if _, err := conn.Write(req); err != nil {
+		return err
+	}
+	var rep [4]byte
+	if _, err := io.ReadFull(conn, rep[:]); err != nil {
+		return err
+	}
+	if rep[0] != 0x05 || rep[1] != 0x00 {
+		return fmt.Errorf("upstream refused (reply 0x%02x)", rep[1])
+	}
+	// drain BND.ADDR/BND.PORT, reusing the server-side address parser
+	if _, err := readATYPAddr(conn, rep[3]); err != nil {
+		return err
+	}
+	var bnd [2]byte
+	if _, err := io.ReadFull(conn, bnd[:]); err != nil {
+		return err
+	}
+	return conn.SetDeadline(time.Time{})
 }
 
 // relay copies data between client and upstream in both directions until
