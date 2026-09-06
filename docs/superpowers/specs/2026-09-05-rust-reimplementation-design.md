@@ -1,4 +1,4 @@
-# tailcat-dns-proxy Rust 复刻设计（tokio 生态，第三实现）
+# tailcat-socks Rust 复刻设计（tokio 生态，第三实现）
 
 日期：2026-09-05
 状态：已批准
@@ -24,7 +24,7 @@ tailcat-socks/
 │   │   ├── proxy.rs       # Server / SOCKS5 服务端 / 上游握手 / relay
 │   │   ├── tailcat.rs     # spawn_socks / wait_ready / terminate
 │   │   ├── error.rs       # thiserror 错误类型
-│   │   ├── logging.rs     # [tailcat-dns-proxy] 前缀日志
+│   │   ├── logging.rs     # [tailcat-socks] 前缀日志
 │   │   └── bin/fake-tailcat.rs  # 测试用假 tailcat（cargo bin 目标）
 │   └── tests/               # 集成测试（e2e / autolaunch / waitready_deadport；dnsmap 热加载与 relay 为 src 内单元测试）
 ├── bin/{start,stop,restart}.sh   # 增加 rust 选项
@@ -89,7 +89,7 @@ libc       = "0.2"    # 仅 unix：向 tailcat 子进程发 SIGTERM（tokio 只�
 4. bind 监听，失败退出码 1。
 5. 非 `--no-autolaunch`：`tokio::process::Command(tailcat, ["socks", "--listen=host:port"])` 拉起（stdout/stderr inherit 汇入同一日志）；`wait_ready` 轮询 TCP 连通（15s 超时、200ms 间隔）；不就绪则终止子进程、退出码 1。
 6. 非 `--no-watch`：spawn watcher 任务（1s 间隔，CancellationToken）。
-7. spawn serve 循环；打三条日志（`listening socks5h://host:port`、`N domain(s) mapped -> M token(s)`、`upstream addr`），前缀 `[tailcat-dns-proxy]`，格式与 Go 版一致。
+7. spawn serve 循环；打三条日志（`listening socks5h://host:port`、`N domain(s) mapped -> M token(s)`、`upstream addr`），前缀 `[tailcat-socks]`，格式与 Go 版一致。
 8. `select!` 信号 vs serve 退出；serve 因取消产生的 `ErrClosed` 类错误静默。退出时：cancel token → 停监听 → 终止子进程（`libc::kill(pid, SIGTERM)` → 等 5s → `start_kill()` SIGKILL）。
 
 ### error（error.rs）
@@ -98,7 +98,7 @@ libc       = "0.2"    # 仅 unix：向 tailcat 子进程发 SIGTERM（tokio 只�
 
 ## bin/ 脚本集成
 
-- `start.sh`：`rust` 分支 → `BIN="$ROOT/rust/target/release/tailcat-dns-proxy"`、PID/LOG 为 `run/tailcat-dns-proxy-rust.{pid,log}`；二进制缺失时 `cargo build --release`（在 `rust/` 目录）；运行命令 `nohup "$BIN" …`（与 go 分支同构）。
+- `start.sh`：`rust` 分支 → `BIN="$ROOT/rust/target/release/tailcat-socks"`、PID/LOG 为 `run/tailcat-socks-rust.{pid,log}`；二进制缺失时 `cargo build --release`（在 `rust/` 目录）；运行命令 `nohup "$BIN" …`（与 go 分支同构）。
 - `stop.sh` / `restart.sh`：候选版本从 `go|python` 扩为 `go|python|rust`；默认行为（无参数）覆盖全部版本；pid 归属校验逻辑复用，无改动。
 - 环境变量 `LISTEN / DNS_FILE / UPSTREAM / TAILCAT_BIN / PROXY_ARGS` 三版共用。
 - 用法注释更新为 `[go|python|rust]`。
@@ -129,6 +129,6 @@ libc       = "0.2"    # 仅 unix：向 tailcat 子进程发 SIGTERM（tokio 只�
 
 - 不支持 UDP ASSOCIATE / BIND（回失败）。
 - 不支持用户名/密码认证。
-- 不引入 tracing/log 框架（保留 `[tailcat-dns-proxy]` 前缀小宏，日志格式与现网一致）。
+- 不引入 tracing/log 框架（保留 `[tailcat-socks]` 前缀小宏，日志格式与现网一致）。
 - 不做 Docker 集成（镜像继续基于 Go 版）。
 - 不追求与 Go 版源码级同构（方案 B 允许地道 Rust 结构），但**可观察行为必须对齐**。

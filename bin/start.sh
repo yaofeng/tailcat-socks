@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start tailcat-dns-proxy in the background.
+# Start tailcat-socks in the background.
 # Usage: bin/start.sh [go|python|rust]    (default: go)
 # Config via env (all optional):
 #   LISTEN=127.0.0.1:1080  DNS_FILE=<root>/dns.txt  UPSTREAM=127.0.0.1:0
@@ -19,19 +19,19 @@ fi
 IMPL="${1:-go}"
 case "$IMPL" in
   go)
-    BIN="$ROOT/go/bin/tailcat-dns-proxy"
-    PID_FILE="$RUN_DIR/tailcat-dns-proxy-go.pid"
-    LOG_FILE="$RUN_DIR/tailcat-dns-proxy-go.log"
+    BIN="$ROOT/go/bin/tailcat-socks"
+    PID_FILE="$RUN_DIR/tailcat-socks-go.pid"
+    LOG_FILE="$RUN_DIR/tailcat-socks-go.log"
     ;;
   python)
-    SRC="$ROOT/python/tailcat_dns_proxy.py"
-    PID_FILE="$RUN_DIR/tailcat-dns-proxy-python.pid"
-    LOG_FILE="$RUN_DIR/tailcat-dns-proxy-python.log"
+    SRC="$ROOT/python/tailcat_socks.py"
+    PID_FILE="$RUN_DIR/tailcat-socks-python.pid"
+    LOG_FILE="$RUN_DIR/tailcat-socks-python.log"
     ;;
   rust)
-    BIN="$ROOT/rust/target/release/tailcat-dns-proxy"
-    PID_FILE="$RUN_DIR/tailcat-dns-proxy-rust.pid"
-    LOG_FILE="$RUN_DIR/tailcat-dns-proxy-rust.log"
+    BIN="$ROOT/rust/target/release/tailcat-socks"
+    PID_FILE="$RUN_DIR/tailcat-socks-rust.pid"
+    LOG_FILE="$RUN_DIR/tailcat-socks-rust.log"
     ;;
   *)
     echo "usage: $0 [go|python|rust]" >&2
@@ -52,7 +52,7 @@ mkdir -p "$RUN_DIR"
 is_ours() {
   local token
   while IFS= read -r -d '' token; do
-    [[ "$token" == *tailcat-dns-proxy || "$token" == *tailcat_dns_proxy.py ]] && return 0
+    [[ "$token" == *tailcat-socks || "$token" == *tailcat_socks.py ]] && return 0
   done 2>/dev/null < "/proc/$1/cmdline"
   return 1
 }
@@ -70,7 +70,7 @@ fi
 # Build the proxy if the binary is missing (requires the toolchain).
 if [[ "$IMPL" == go && ! -x "$BIN" ]]; then
   echo "go binary missing; building (go build)..."
-  (cd "$ROOT/go" && go build -o bin/tailcat-dns-proxy .)
+  (cd "$ROOT/go" && go build -o bin/tailcat-socks .)
 fi
 if [[ "$IMPL" == rust && ! -x "$BIN" ]]; then
   echo "rust binary missing; building (cargo build --release)..."

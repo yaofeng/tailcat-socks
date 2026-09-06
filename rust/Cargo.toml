@@ -1,5 +1,5 @@
 [package]
-name = "tailcat-dns-proxy"
+name = "tailcat-socks"
 version = "0.1.0"
 edition = "2021"
 description = "SOCKS5 front proxy that rewrites domains to tailcat tokens (Rust implementation)"

@@ -1,10 +1,10 @@
 services:
-  tailcat-dns-proxy:
+  tailcat-socks:
     build:
       context: ..                       # repo root so COPY go/ + dns.txt.example resolve
       dockerfile: docker/Dockerfile
     image: yaofeng928/tailcat-socks:latest
-    container_name: tailcat-dns-proxy
+    container_name: tailcat-socks
     # Mount the CONTAINING DIRECTORY (not the file): editors replace files on
     # save, and a file-level bind-mount pins the old inode so hot-reload would
     # miss it. A directory mount tracks the rename, so the proxy sees edits.

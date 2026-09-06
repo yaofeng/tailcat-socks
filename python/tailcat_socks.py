@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tailcat-dns-proxy: a SOCKS5 front proxy that rewrites real domain names to
+"""tailcat-socks: a SOCKS5 front proxy that rewrites real domain names to
 tailcat tokens (tc...) and chains to a single standalone `tailcat socks` upstream.
 
 Reads a dns.txt mapping (one token per line, then its domains space/tab separated):
@@ -18,7 +18,7 @@ listen port is taken from --upstream host:port; if the port is 0 or omitted, a
 high random free port is chosen. dns.txt is hot-reloaded when it changes.
 
 Usage:
-    python3 tailcat_dns_proxy.py --listen 127.0.0.1:1080 --dns-file dns.txt
+    python3 tailcat_socks.py --listen 127.0.0.1:1080 --dns-file dns.txt
 """
 import argparse
 import atexit
@@ -272,12 +272,12 @@ def watch_dns_file(path, proxy, interval=1.0, stop=None):
         try:
             new_map = load_dns_map(path)
         except OSError as e:
-            print(f"[tailcat-dns-proxy] reload failed ({e}); keeping previous map",
+            print(f"[tailcat-socks] reload failed ({e}); keeping previous map",
                   file=sys.stderr)
             continue
         last = mtime
         proxy.dns_map = new_map
-        print(f"[tailcat-dns-proxy] reloaded {path}: "
+        print(f"[tailcat-socks] reloaded {path}: "
               f"{len(new_map)} domain(s) -> {len(set(new_map.values()))} token(s)")
 
 
@@ -301,7 +301,7 @@ def _spawn_tailcat_socks(bin_path, listen_addr):
     try:
         return subprocess.Popen(cmd)
     except OSError as e:
-        print(f"[tailcat-dns-proxy] failed to launch {bin_path}: {e}", file=sys.stderr)
+        print(f"[tailcat-socks] failed to launch {bin_path}: {e}", file=sys.stderr)
         return None
 
 
@@ -344,11 +344,11 @@ def main(argv=None):
             return 1
         atexit.register(_terminate, proc)
         if not _wait_ready(upstream):
-            print(f"[tailcat-dns-proxy] upstream {upstream} not ready; aborting",
+            print(f"[tailcat-socks] upstream {upstream} not ready; aborting",
                   file=sys.stderr)
             _terminate(proc)
             return 1
-        print(f"[tailcat-dns-proxy] auto-launched {args.tailcat_bin} socks on {up_host}:{up_port}")
+        print(f"[tailcat-socks] auto-launched {args.tailcat_bin} socks on {up_host}:{up_port}")
 
     # Clean up the child on Ctrl-C or SIGTERM by surfacing them as exceptions.
     def _on_signal(signum, frame):
@@ -362,9 +362,9 @@ def main(argv=None):
         threading.Thread(target=watch_dns_file, args=(args.dns_file, proxy),
                          daemon=True).start()
 
-    print(f"[tailcat-dns-proxy] listening socks5h://{proxy._sock.getsockname()[0]}:{proxy.port}")
-    print(f"[tailcat-dns-proxy] {len(dns_map)} domain(s) mapped -> {len(set(dns_map.values()))} token(s)")
-    print(f"[tailcat-dns-proxy] upstream {up_host}:{up_port}")
+    print(f"[tailcat-socks] listening socks5h://{proxy._sock.getsockname()[0]}:{proxy.port}")
+    print(f"[tailcat-socks] {len(dns_map)} domain(s) mapped -> {len(set(dns_map.values()))} token(s)")
+    print(f"[tailcat-socks] upstream {up_host}:{up_port}")
     try:
         proxy.serve_forever()
     except KeyboardInterrupt:

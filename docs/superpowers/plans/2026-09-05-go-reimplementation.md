@@ -1,10 +1,10 @@
-# tailcat-dns-proxy Go 重构实现计划
+# tailcat-socks Go 重构实现计划
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将 Python 实现迁入 `python/`，用 Go 复刻行为完全一致的代理到 `go/`，Docker 改为构建 Go 版，`bin/start.sh` 支持选择启动两个版本。
 
-**Architecture:** 单二进制 Go 程序（纯标准库），三个模块：`dnsmap.go`（dns.txt 解析 + atomic 热加载）、`proxy.go`（SOCKS5 服务端 + 上游客户端握手 + 双向 relay）、`main.go`（flag/autolaunch/信号/编排）。SOCKS5 协议逐字节对齐 Python 版（`python/tailcat_dns_proxy.py`）。
+**Architecture:** 单二进制 Go 程序（纯标准库），三个模块：`dnsmap.go`（dns.txt 解析 + atomic 热加载）、`proxy.go`（SOCKS5 服务端 + 上游客户端握手 + 双向 relay）、`main.go`（flag/autolaunch/信号/编排）。SOCKS5 协议逐字节对齐 Python 版（`python/tailcat_socks.py`）。
 
 **Tech Stack:** Go 1.23（无第三方依赖）、Python 3.8+（现有实现）、bash、Docker 多阶段构建（golang:1.23 → debian:bookworm-slim）。
 
@@ -13,10 +13,10 @@
 **目标目录结构：**
 
 ```
-tailcat-dns-proxy/
+tailcat-socks/
 ├── python/
-│   ├── tailcat_dns_proxy.py
-│   └── tests/test_tailcat_dns_proxy.py
+│   ├── tailcat_socks.py
+│   └── tests/test_tailcat_socks.py
 ├── go/
 │   ├── go.mod
 │   ├── dnsmap.go / dnsmap_test.go
@@ -91,21 +91,21 @@ export GOPROXY=https://goproxy.cn,direct
 ### Task 2: 迁移 Python 实现到 python/
 
 **Files:**
-- Move: `src/tailcat_dns_proxy.py` → `python/tailcat_dns_proxy.py`
+- Move: `src/tailcat_socks.py` → `python/tailcat_socks.py`
 - Move: `tests/` → `python/tests/`
-- Modify: `python/tests/test_tailcat_dns_proxy.py:14`（sys.path 一行）
+- Modify: `python/tests/test_tailcat_socks.py:14`（sys.path 一行）
 
 - [ ] **Step 1: git mv 保留历史**
 
 ```bash
 mkdir -p python
-git mv src/tailcat_dns_proxy.py python/tailcat_dns_proxy.py
+git mv src/tailcat_socks.py python/tailcat_socks.py
 git mv tests python/tests
 ```
 
 - [ ] **Step 2: 修正测试的 sys.path**
 
-`python/tests/test_tailcat_dns_proxy.py` 第 14 行：
+`python/tests/test_tailcat_socks.py` 第 14 行：
 
 ```python
 # 旧
@@ -142,7 +142,7 @@ git -c user.name="YaoFeng" -c user.email="yaofeng@crowddigital.cn" commit -m "Mo
 
 ```bash
 mkdir -p go && cat > go/go.mod <<'EOF'
-module tailcat-dns-proxy
+module tailcat-socks
 
 go 1.23
 EOF
@@ -369,7 +369,7 @@ func WatchDNSFile(path string, m *DNSMap, interval time.Duration, stop <-chan st
 	if first, err := LoadDNSFile(path); err == nil {
 		m.Store(first)
 	} else {
-		log.Printf("[tailcat-dns-proxy] initial load of %s failed: %v", path, err)
+		log.Printf("[tailcat-socks] initial load of %s failed: %v", path, err)
 	}
 	var lastMod time.Time
 	if fi, err := os.Stat(path); err == nil {
@@ -389,12 +389,12 @@ func WatchDNSFile(path string, m *DNSMap, interval time.Duration, stop <-chan st
 		}
 		newMap, err := LoadDNSFile(path)
 		if err != nil {
-			log.Printf("[tailcat-dns-proxy] reload failed (%v); keeping previous map", err)
+			log.Printf("[tailcat-socks] reload failed (%v); keeping previous map", err)
 			continue
 		}
 		lastMod = fi.ModTime()
 		m.Store(newMap)
-		log.Printf("[tailcat-dns-proxy] reloaded %s: %d domain(s) -> %d token(s)",
+		log.Printf("[tailcat-socks] reloaded %s: %d domain(s) -> %d token(s)",
 			path, len(newMap), len(tokenSet(newMap)))
 	}
 }
@@ -1227,10 +1227,10 @@ Expected: `undefined: parseAddr` 等编译错误。
 - [ ] **Step 4: 完整实现 `go/main.go`**
 
 ```go
-// tailcat-dns-proxy: a SOCKS5 front proxy that rewrites real domain names to
+// tailcat-socks: a SOCKS5 front proxy that rewrites real domain names to
 // tailcat tokens (tc...) and chains to a single standalone `tailcat socks`
 // upstream. This is a behavioral replica of the Python version
-// (python/tailcat_dns_proxy.py); see README.md for usage.
+// (python/tailcat_socks.py); see README.md for usage.
 package main
 
 import (
@@ -1249,7 +1249,7 @@ import (
 )
 
 func main() {
-	log.SetFlags(0) // messages already carry the [tailcat-dns-proxy] prefix
+	log.SetFlags(0) // messages already carry the [tailcat-socks] prefix
 	var (
 		listen       = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen addr:port")
 		dnsFile      = flag.String("dns-file", "dns.txt", "domain->token mapping file")
@@ -1265,7 +1265,7 @@ func main() {
 func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch bool) int {
 	first, err := LoadDNSFile(dnsFile)
 	if err != nil {
-		log.Printf("[tailcat-dns-proxy] cannot load %s: %v", dnsFile, err)
+		log.Printf("[tailcat-socks] cannot load %s: %v", dnsFile, err)
 		return 1
 	}
 	dnsMap := &DNSMap{}
@@ -1274,7 +1274,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	// Resolve the tailcat socks listen port: explicit port wins, else high random.
 	upHost, upPort, err := parseAddr(upstream, 0)
 	if err != nil {
-		log.Printf("[tailcat-dns-proxy] bad --upstream: %v", err)
+		log.Printf("[tailcat-socks] bad --upstream: %v", err)
 		return 1
 	}
 	if upPort == 0 {
@@ -1284,7 +1284,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 
 	srv, err := NewServer(dnsMap, upAddr, listen)
 	if err != nil {
-		log.Printf("[tailcat-dns-proxy] cannot listen on %s: %v", listen, err)
+		log.Printf("[tailcat-socks] cannot listen on %s: %v", listen, err)
 		return 1
 	}
 
@@ -1296,12 +1296,12 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 			return 1
 		}
 		if !waitReady(upAddr, 15*time.Second) {
-			log.Printf("[tailcat-dns-proxy] upstream %s not ready; aborting", upAddr)
+			log.Printf("[tailcat-socks] upstream %s not ready; aborting", upAddr)
 			terminate(child)
 			srv.Close()
 			return 1
 		}
-		log.Printf("[tailcat-dns-proxy] auto-launched %s socks on %s", tailcatBin, upAddr)
+		log.Printf("[tailcat-socks] auto-launched %s socks on %s", tailcatBin, upAddr)
 	}
 
 	stopWatch := make(chan struct{})
@@ -1313,10 +1313,10 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	go func() { serveErr <- srv.Serve() }()
 
 	host, port, _ := net.SplitHostPort(srv.ActualAddr().String())
-	log.Printf("[tailcat-dns-proxy] listening socks5h://%s:%s", host, port)
-	log.Printf("[tailcat-dns-proxy] %d domain(s) mapped -> %d token(s)",
+	log.Printf("[tailcat-socks] listening socks5h://%s:%s", host, port)
+	log.Printf("[tailcat-socks] %d domain(s) mapped -> %d token(s)",
 		len(first), len(tokenSet(first)))
-	log.Printf("[tailcat-dns-proxy] upstream %s", upAddr)
+	log.Printf("[tailcat-socks] upstream %s", upAddr)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -1324,7 +1324,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	case <-sig:
 	case err := <-serveErr:
 		if err != nil {
-			log.Printf("[tailcat-dns-proxy] server error: %v", err)
+			log.Printf("[tailcat-socks] server error: %v", err)
 		}
 	}
 	close(stopWatch)
@@ -1368,7 +1368,7 @@ func freeHighPort(host string) int {
 	}
 	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
 	if err != nil {
-		log.Fatalf("[tailcat-dns-proxy] cannot find a free port: %v", err)
+		log.Fatalf("[tailcat-socks] cannot find a free port: %v", err)
 	}
 	defer ln.Close()
 	return ln.Addr().(*net.TCPAddr).Port
@@ -1382,7 +1382,7 @@ func spawnTailcatSocks(binPath, host string, port int) *exec.Cmd {
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		log.Printf("[tailcat-dns-proxy] failed to launch %s: %v", binPath, err)
+		log.Printf("[tailcat-socks] failed to launch %s: %v", binPath, err)
 		return nil
 	}
 	return cmd
@@ -1463,7 +1463,7 @@ FROM golang:1.23-bookworm AS build
 WORKDIR /src
 COPY go/ /src/go/
 # Static binary (CGO off) so the slim runtime stage needs nothing else.
-RUN cd /src/go && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/tailcat-dns-proxy .
+RUN cd /src/go && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/tailcat-socks .
 # Pin a version for reproducibility; bump as needed.
 RUN go install github.com/tailscale/tailcat/cmd/tailcat@latest
 
@@ -1474,7 +1474,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /out/tailcat-dns-proxy /usr/local/bin/tailcat-dns-proxy
+COPY --from=build /out/tailcat-socks /usr/local/bin/tailcat-socks
 COPY --from=build /go/bin/tailcat /usr/local/bin/tailcat
 
 WORKDIR /app
@@ -1491,7 +1491,7 @@ ENV LISTEN=0.0.0.0:1080 \
 EXPOSE 1080
 
 # exec so PID 1 forwards signals -> proxy cleans up its tailcat child.
-CMD ["sh", "-c", "exec tailcat-dns-proxy --listen \"$LISTEN\" --dns-file \"$DNS_FILE\" --upstream \"$UPSTREAM\" --tailcat-bin \"$TAILCAT_BIN\""]
+CMD ["sh", "-c", "exec tailcat-socks --listen \"$LISTEN\" --dns-file \"$DNS_FILE\" --upstream \"$UPSTREAM\" --tailcat-bin \"$TAILCAT_BIN\""]
 ```
 
 - [ ] **Step 2: 创建 `.dockerignore`**
@@ -1516,7 +1516,7 @@ Expected: 构建成功（容器内需联网下载 tailcat；若 Go 模块下载�
 - [ ] **Step 4: 验证镜像内二进制可运行**
 
 ```bash
-docker run --rm tailcat-dns-proxy:latest tailcat-dns-proxy --help
+docker run --rm tailcat-socks:latest tailcat-socks --help
 ```
 
 Expected: 打印 `-listen`、`-dns-file`、`-upstream`、`-tailcat-bin`、`-no-autolaunch`、`-no-watch` 等 flag 帮助。
@@ -1539,7 +1539,7 @@ git -c user.name="YaoFeng" -c user.email="yaofeng@crowddigital.cn" commit -m "Do
 
 ```bash
 #!/usr/bin/env bash
-# Start tailcat-dns-proxy in the background.
+# Start tailcat-socks in the background.
 # Usage: bin/start.sh [go|python]    (default: go)
 # Config via env (all optional):
 #   LISTEN=127.0.0.1:1080  DNS_FILE=<root>/dns.txt  UPSTREAM=127.0.0.1:0
@@ -1552,14 +1552,14 @@ RUN_DIR="$ROOT/run"
 IMPL="${1:-go}"
 case "$IMPL" in
   go)
-    BIN="$ROOT/go/bin/tailcat-dns-proxy"
-    PID_FILE="$RUN_DIR/tailcat-dns-proxy-go.pid"
-    LOG_FILE="$RUN_DIR/tailcat-dns-proxy-go.log"
+    BIN="$ROOT/go/bin/tailcat-socks"
+    PID_FILE="$RUN_DIR/tailcat-socks-go.pid"
+    LOG_FILE="$RUN_DIR/tailcat-socks-go.log"
     ;;
   python)
-    SRC="$ROOT/python/tailcat_dns_proxy.py"
-    PID_FILE="$RUN_DIR/tailcat-dns-proxy-python.pid"
-    LOG_FILE="$RUN_DIR/tailcat-dns-proxy-python.log"
+    SRC="$ROOT/python/tailcat_socks.py"
+    PID_FILE="$RUN_DIR/tailcat-socks-python.pid"
+    LOG_FILE="$RUN_DIR/tailcat-socks-python.log"
     ;;
   *)
     echo "usage: $0 [go|python]" >&2
@@ -1582,7 +1582,7 @@ fi
 # Build the Go proxy if the binary is missing (requires a Go toolchain).
 if [[ "$IMPL" == go && ! -x "$BIN" ]]; then
   echo "go binary missing; building (go build)..."
-  (cd "$ROOT/go" && go build -o bin/tailcat-dns-proxy .)
+  (cd "$ROOT/go" && go build -o bin/tailcat-socks .)
 fi
 
 : > "$LOG_FILE"   # truncate on each fresh start
@@ -1602,7 +1602,7 @@ echo "started [$IMPL] pid $(cat "$PID_FILE")  listen=$LISTEN  log=$LOG_FILE"
 
 ```bash
 #!/usr/bin/env bash
-# Stop tailcat-dns-proxy (and its auto-launched tailcat socks child, which
+# Stop tailcat-socks (and its auto-launched tailcat socks child, which
 # the proxy terminates on SIGTERM via its signal handler).
 # Usage: bin/stop.sh [go|python]   (no arg = stop both)
 set -euo pipefail
@@ -1612,9 +1612,9 @@ RUN_DIR="$ROOT/run"
 
 IMPL="${1:-}"
 case "$IMPL" in
-  "")     PID_FILES=("$RUN_DIR/tailcat-dns-proxy-go.pid" "$RUN_DIR/tailcat-dns-proxy-python.pid") ;;
-  go)     PID_FILES=("$RUN_DIR/tailcat-dns-proxy-go.pid") ;;
-  python) PID_FILES=("$RUN_DIR/tailcat-dns-proxy-python.pid") ;;
+  "")     PID_FILES=("$RUN_DIR/tailcat-socks-go.pid" "$RUN_DIR/tailcat-socks-python.pid") ;;
+  go)     PID_FILES=("$RUN_DIR/tailcat-socks-go.pid") ;;
+  python) PID_FILES=("$RUN_DIR/tailcat-socks-python.pid") ;;
   *)      echo "usage: $0 [go|python]" >&2; exit 2 ;;
 esac
 
@@ -1652,7 +1652,7 @@ fi
 
 ```bash
 #!/usr/bin/env bash
-# Restart tailcat-dns-proxy. Usage: bin/restart.sh [go|python]
+# Restart tailcat-socks. Usage: bin/restart.sh [go|python]
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$DIR/stop.sh" "${1:-}"
@@ -1671,13 +1671,13 @@ Expected: `OK`。
 
 ```bash
 # Python 版
-bin/start.sh python && sleep 1 && ps -p "$(cat run/tailcat-dns-proxy-python.pid)" >/dev/null && echo "python alive"
-tail -3 run/tailcat-dns-proxy-python.log
+bin/start.sh python && sleep 1 && ps -p "$(cat run/tailcat-socks-python.pid)" >/dev/null && echo "python alive"
+tail -3 run/tailcat-socks-python.log
 bin/stop.sh python
 
 # Go 版（首次自动构建）
-bin/start.sh go && sleep 1 && ps -p "$(cat run/tailcat-dns-proxy-go.pid)" >/dev/null && echo "go alive"
-tail -3 run/tailcat-dns-proxy-go.log
+bin/start.sh go && sleep 1 && ps -p "$(cat run/tailcat-socks-go.pid)" >/dev/null && echo "go alive"
+tail -3 run/tailcat-socks-go.log
 bin/stop.sh go
 ```
 
@@ -1814,11 +1814,11 @@ kill %1 2>/dev/null || pkill -f fake_upstream.py
 
 ```bash
 # Go 版（推荐：先构建一次）
-cd go && go build -o bin/tailcat-dns-proxy . && cd ..
-go/bin/tailcat-dns-proxy
+cd go && go build -o bin/tailcat-socks . && cd ..
+go/bin/tailcat-socks
 
 # Python 版
-python3 python/tailcat_dns_proxy.py
+python3 python/tailcat_socks.py
 ```
 
 4. 「启停脚本(bin/)」节替换为：
@@ -1828,20 +1828,20 @@ bin/start.sh          # 后台启动 Go 版（缺二进制时自动 go build）
 bin/start.sh python   # 后台启动 Python 版
 bin/stop.sh           # 停止（不带参数停两个版本；bin/stop.sh go 只停 Go 版）
 bin/restart.sh [go|python]
-tail -f run/tailcat-dns-proxy-go.log      # 或 tailcat-dns-proxy-python.log
+tail -f run/tailcat-socks-go.log      # 或 tailcat-socks-python.log
 ```
 
-pid/log 按版本分离：`run/tailcat-dns-proxy-{go,python}.{pid,log}`。
+pid/log 按版本分离：`run/tailcat-socks-{go,python}.{pid,log}`。
 
 5. 「Docker」节补一句：镜像 runtime 为 `debian:bookworm-slim`，内含 Go 静态编译的代理二进制与 tailcat，不再依赖 Python。
 
 6. 「目录结构」节替换为：
 
 ```
-tailcat-dns-proxy/
+tailcat-socks/
 ├── python/
-│   ├── tailcat_dns_proxy.py          # Python 版代理主体（纯标准库）
-│   └── tests/test_tailcat_dns_proxy.py
+│   ├── tailcat_socks.py          # Python 版代理主体（纯标准库）
+│   └── tests/test_tailcat_socks.py
 ├── go/                               # Go 复刻版（行为一致）
 │   ├── main.go                       # flag / tailcat 自动拉起 / 信号
 │   ├── dnsmap.go                     # dns.txt 解析 + 原子热加载
@@ -1888,7 +1888,7 @@ Expected: gofmt 无输出、vet 干净、Go 全 PASS、Python 全 PASS。
 - [ ] **Step 2: Docker 复验**
 
 ```bash
-cd docker && docker compose build >/dev/null 2>&1 && docker run --rm tailcat-dns-proxy:latest tailcat-dns-proxy --help | head -5
+cd docker && docker compose build >/dev/null 2>&1 && docker run --rm tailcat-socks:latest tailcat-socks --help | head -5
 ```
 
 Expected: 帮助输出正常。

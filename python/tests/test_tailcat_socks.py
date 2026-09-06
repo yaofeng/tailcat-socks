@@ -1,7 +1,7 @@
-"""Tests for tailcat_dns_proxy: dns.txt parsing, host rewriting, hot-reload,
+"""Tests for tailcat_socks: dns.txt parsing, host rewriting, hot-reload,
 and end-to-end SOCKS5 host rewriting through a fake upstream.
 
-Run:  python3 -m pytest tests -v     (or: python3 tests/test_tailcat_dns_proxy.py)
+Run:  python3 -m pytest tests -v     (or: python3 tests/test_tailcat_socks.py)
 """
 import os
 import socket
@@ -13,7 +13,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from tailcat_dns_proxy import load_dns_map, rewrite_host, Socks5Proxy, watch_dns_file
+from tailcat_socks import load_dns_map, rewrite_host, Socks5Proxy, watch_dns_file
 
 
 # ---------- dns.txt parsing ----------

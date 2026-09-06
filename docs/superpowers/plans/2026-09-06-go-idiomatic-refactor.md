@@ -57,7 +57,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ### Task 2: Logging via `log/slog`
 
-`log.SetFlags(0)` + a hand-repeated `"[tailcat-dns-proxy] "` literal in ~15 calls is pre-slog style. `log/slog` structured logging is the current standard for all new Go code.
+`log.SetFlags(0)` + a hand-repeated `"[tailcat-socks] "` literal in ~15 calls is pre-slog style. `log/slog` structured logging is the current standard for all new Go code.
 
 **Files:**
 - Modify: `go/main.go`, `go/dnsmap.go`, `go/proxy.go` (accept backoff lands in Task 8; here only existing calls)

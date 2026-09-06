@@ -1,7 +1,7 @@
-// tailcat-dns-proxy: a SOCKS5 front proxy that rewrites real domain names to
+// tailcat-socks: a SOCKS5 front proxy that rewrites real domain names to
 // tailcat tokens (tc...) and chains to a single standalone `tailcat socks`
 // upstream. This is a behavioral replica of the Python version
-// (python/tailcat_dns_proxy.py); see README.md for usage.
+// (python/tailcat_socks.py); see README.md for usage.
 package main
 
 import (
@@ -20,7 +20,7 @@ import (
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)).With("component", "tailcat-dns-proxy"))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)).With("component", "tailcat-socks"))
 	var (
 		listen       = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address (host:port; empty host binds all interfaces)")
 		dnsFile      = flag.String("dns-file", "dns.txt", "domain->token mapping file")

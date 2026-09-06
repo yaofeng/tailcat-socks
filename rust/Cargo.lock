@@ -238,7 +238,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tailcat-dns-proxy"
+name = "tailcat-socks"
 version = "0.1.0"
 dependencies = [
  "arc-swap",

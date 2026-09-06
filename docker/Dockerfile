@@ -11,7 +11,7 @@ RUN go install github.com/tailscale/tailcat/cmd/tailcat@latest
 
 WORKDIR /src
 COPY go/ /src/go/
-RUN cd /src/go && go build -trimpath -ldflags="-s -w" -o /out/tailcat-dns-proxy .
+RUN cd /src/go && go build -trimpath -ldflags="-s -w" -o /out/tailcat-socks .
 
 # ---- runtime stage ----
 # Alpine, not debian-slim: both binaries are fully static (CGO off), so the
@@ -20,7 +20,7 @@ FROM alpine:3.22
 
 RUN apk add --no-cache ca-certificates
 
-COPY --from=build /out/tailcat-dns-proxy /usr/local/bin/tailcat-dns-proxy
+COPY --from=build /out/tailcat-socks /usr/local/bin/tailcat-socks
 COPY --from=build /go/bin/tailcat /usr/local/bin/tailcat
 
 WORKDIR /app
@@ -37,4 +37,4 @@ ENV LISTEN=0.0.0.0:1080 \
 EXPOSE 1080
 
 # exec so PID 1 forwards signals -> proxy cleans up its tailcat child.
-CMD ["sh", "-c", "exec tailcat-dns-proxy --listen \"$LISTEN\" --dns-file \"$DNS_FILE\" --upstream \"$UPSTREAM\" --tailcat-bin \"$TAILCAT_BIN\""]
+CMD ["sh", "-c", "exec tailcat-socks --listen \"$LISTEN\" --dns-file \"$DNS_FILE\" --upstream \"$UPSTREAM\" --tailcat-bin \"$TAILCAT_BIN\""]

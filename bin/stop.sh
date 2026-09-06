@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop tailcat-dns-proxy (and its auto-launched tailcat socks child, which
+# Stop tailcat-socks (and its auto-launched tailcat socks child, which
 # the proxy terminates on SIGTERM via its signal handler).
 # Usage: bin/stop.sh [go|python|rust]   (no arg = stop all)
 set -euo pipefail
@@ -9,21 +9,21 @@ RUN_DIR="$ROOT/run"
 
 IMPL="${1:-}"
 case "$IMPL" in
-  "")     PID_FILES=("$RUN_DIR/tailcat-dns-proxy-go.pid" "$RUN_DIR/tailcat-dns-proxy-python.pid" "$RUN_DIR/tailcat-dns-proxy-rust.pid") ;;
-  go)     PID_FILES=("$RUN_DIR/tailcat-dns-proxy-go.pid") ;;
-  python) PID_FILES=("$RUN_DIR/tailcat-dns-proxy-python.pid") ;;
-  rust)   PID_FILES=("$RUN_DIR/tailcat-dns-proxy-rust.pid") ;;
+  "")     PID_FILES=("$RUN_DIR/tailcat-socks-go.pid" "$RUN_DIR/tailcat-socks-python.pid" "$RUN_DIR/tailcat-socks-rust.pid") ;;
+  go)     PID_FILES=("$RUN_DIR/tailcat-socks-go.pid") ;;
+  python) PID_FILES=("$RUN_DIR/tailcat-socks-python.pid") ;;
+  rust)   PID_FILES=("$RUN_DIR/tailcat-socks-rust.pid") ;;
   *)      echo "usage: $0 [go|python|rust]" >&2; exit 2 ;;
 esac
 
-# Only signal a pid that really is a tailcat-dns-proxy: a pid file can outlive
+# Only signal a pid that really is a tailcat-socks: a pid file can outlive
 # a reboot and land on an unrelated process. Match exact argv tokens, not
-# substrings — e.g. `tail -f run/tailcat-dns-proxy-go.log` mentions the proxy
+# substrings — e.g. `tail -f run/tailcat-socks-go.log` mentions the proxy
 # but is not the proxy.
 is_ours() {
   local token
   while IFS= read -r -d '' token; do
-    [[ "$token" == *tailcat-dns-proxy || "$token" == *tailcat_dns_proxy.py ]] && return 0
+    [[ "$token" == *tailcat-socks || "$token" == *tailcat_socks.py ]] && return 0
   done 2>/dev/null < "/proc/$1/cmdline"
   return 1
 }

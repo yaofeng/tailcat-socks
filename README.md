@@ -1,4 +1,4 @@
-# tailcat-dns-proxy
+# tailcat-socks
 
 一个带**域名解析**的 SOCKS5 前置代理:把 `curl http://www.example.com/` 里的真实域名,按 `dns.txt` 里的映射改写成 [tailcat](https://github.com/tailscale/tailcat) 的 token(`tc...`),再转交给 `tailcat socks` 通过 WireGuard/DERP 隧道打到对应机器。
 
@@ -43,9 +43,9 @@ tcoAbCdEf789     www.example.com
 
 ## 安装依赖
 
-- Go 版:Go 1.23+(构建用;或直接用已构建的 `go/bin/tailcat-dns-proxy`)
+- Go 版:Go 1.23+(构建用;或直接用已构建的 `go/bin/tailcat-socks`)
 - Python 版:Python 3.8+(仅标准库)
-- Rust 版:Rust 1.85+(构建用;或直接用已构建的 `rust/target/release/tailcat-dns-proxy`)
+- Rust 版:Rust 1.85+(构建用;或直接用已构建的 `rust/target/release/tailcat-socks`)
 - `tailcat`:https://github.com/tailscale/tailcat(`brew install tailcat` 或 `go install github.com/tailscale/tailcat/cmd/tailcat@latest`;注意 tailcat@latest 需要 Go 1.27+ 工具链)
 
 ## 快速开始(裸机)
@@ -57,18 +57,18 @@ cp dns.txt.example dns.txt && $EDITOR dns.txt
 # 前台运行(默认: 监听 127.0.0.1:1080, dns.txt 在仓库根, tailcat socks 用随机高位端口)
 
 # Go 版(推荐:先构建一次)
-cd go && go build -o bin/tailcat-dns-proxy . && cd ..
-go/bin/tailcat-dns-proxy
+cd go && go build -o bin/tailcat-socks . && cd ..
+go/bin/tailcat-socks
 
 # Rust 版(推荐:先构建一次)
 cd rust && cargo build --release && cd ..
-rust/target/release/tailcat-dns-proxy
+rust/target/release/tailcat-socks
 
 # Python 版
-python3 python/tailcat_dns_proxy.py
+python3 python/tailcat_socks.py
 
 # 指定各参数(三版本参数同名同默认,下以 Go 版为例)
-go/bin/tailcat-dns-proxy \
+go/bin/tailcat-socks \
     --listen 127.0.0.1:1080 \
     --dns-file dns.txt \
     --upstream 127.0.0.1:1081 \
@@ -93,7 +93,7 @@ export all_proxy=socks5h://127.0.0.1:1080
 
 ## 启停脚本(bin/)
 
-后台运行,`run/` 下按版本维护 pid 与 log(`run/tailcat-dns-proxy-{go,python,rust}.{pid,log}`):
+后台运行,`run/` 下按版本维护 pid 与 log(`run/tailcat-socks-{go,python,rust}.{pid,log}`):
 
 ```bash
 bin/start.sh          # 后台启动 Go 版(缺二进制时自动 go build)
@@ -103,7 +103,7 @@ bin/stop.sh           # 停止(不带参数停全部版本;bin/stop.sh go 只停
 bin/stop.sh rust      # 只停 Rust 版
 bin/restart.sh        # 无参数 = 停全部 + 启 Go 版;bin/restart.sh python 重启 Python 版
 bin/restart.sh rust   # 重启 Rust 版
-tail -f run/tailcat-dns-proxy-go.log      # 或 ...-python.log / ...-rust.log
+tail -f run/tailcat-socks-go.log      # 或 ...-python.log / ...-rust.log
 ```
 
 脚本只停止确属本代理的进程(校验 /proc pid 归属);start 后若进程秒退(如 dns 文件不存在、端口被占)会直接报错并以非零码退出,并打印日志尾部。
@@ -124,7 +124,7 @@ docker compose down
 - 容器内 `LISTEN=0.0.0.0:1080`,tailcat socks 仍用内部随机高位端口。宿主机经 `1080:1080` 访问。
 - 容器需能出网(DERP/STUN)。
 - 镜像 runtime 为 `alpine:3.22`(全静态二进制不需要 glibc),内含 Go 静态编译的代理二进制与 tailcat,不再依赖 Python;已发布为 `yaofeng928/tailcat-socks:latest`。
-- 手动构建(等价于 compose):在仓库根目录 `docker build -f docker/Dockerfile -t tailcat-dns-proxy .`——context 必须是仓库根,不要写成 `-f docker/Dockerfile ..`(那会把父目录当 context)。
+- 手动构建(等价于 compose):在仓库根目录 `docker build -f docker/Dockerfile -t tailcat-socks .`——context 必须是仓库根,不要写成 `-f docker/Dockerfile ..`(那会把父目录当 context)。
 
 ## dns.txt 热加载
 
@@ -137,10 +137,10 @@ docker compose down
 ## 目录结构
 
 ```
-tailcat-dns-proxy/
+tailcat-socks/
 ├── python/
-│   ├── tailcat_dns_proxy.py          # Python 版代理主体(纯标准库)
-│   └── tests/test_tailcat_dns_proxy.py
+│   ├── tailcat_socks.py          # Python 版代理主体(纯标准库)
+│   └── tests/test_tailcat_socks.py
 ├── go/                               # Go 版(idiomatic Go 重写;fsnotify 热加载)
 │   ├── main.go                       # flag / tailcat 自动拉起 / 信号
 │   ├── dnsmap.go                     # dns.txt 解析 + 原子热加载

@@ -1,12 +1,12 @@
-//! tailcat-dns-proxy: a SOCKS5 front proxy that rewrites real domain names to
+//! tailcat-socks: a SOCKS5 front proxy that rewrites real domain names to
 //! tailcat tokens (tc...) and chains to a single standalone `tailcat socks`
 //! upstream. Rust implementation of the Python/Go versions; see README.md.
 use clap::Parser;
-use tailcat_dns_proxy::config::{free_high_port, join_host_port, parse_addr, Config};
-use tailcat_dns_proxy::dnsmap::{load_dns_file, token_set, watch, DnsMap};
-use tailcat_dns_proxy::logging::log_line;
-use tailcat_dns_proxy::proxy::Server;
-use tailcat_dns_proxy::tailcat::{spawn_socks, terminate, wait_ready};
+use tailcat_socks::config::{free_high_port, join_host_port, parse_addr, Config};
+use tailcat_socks::dnsmap::{load_dns_file, token_set, watch, DnsMap};
+use tailcat_socks::logging::log_line;
+use tailcat_socks::proxy::Server;
+use tailcat_socks::tailcat::{spawn_socks, terminate, wait_ready};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 

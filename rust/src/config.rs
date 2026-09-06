@@ -6,7 +6,7 @@ use std::net::TcpListener;
 /// CLI flags, identical names/defaults to the Go/Python versions.
 #[derive(Parser, Debug)]
 #[command(
-    name = "tailcat-dns-proxy",
+    name = "tailcat-socks",
     about = "SOCKS5 front proxy that rewrites domains to tailcat tokens"
 )]
 pub struct Config {

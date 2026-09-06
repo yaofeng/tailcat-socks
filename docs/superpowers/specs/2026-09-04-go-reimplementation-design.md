@@ -1,4 +1,4 @@
-# tailcat-dns-proxy 双语言重构设计（Python 迁移 + Go 复刻）
+# tailcat-socks 双语言重构设计（Python 迁移 + Go 复刻）
 
 日期：2026-09-04
 状态：已批准
@@ -13,10 +13,10 @@
 ## 目录结构
 
 ```
-tailcat-dns-proxy/
+tailcat-socks/
 ├── python/                          # ← src/ 与 tests/ 移入（纯移动）
-│   ├── tailcat_dns_proxy.py
-│   └── tests/test_tailcat_dns_proxy.py
+│   ├── tailcat_socks.py
+│   └── tests/test_tailcat_socks.py
 ├── go/
 │   ├── go.mod                       # 纯标准库，零第三方依赖
 │   ├── main.go                      # 启动编排：flag / autolaunch / 信号 / 热加载
@@ -62,7 +62,7 @@ Python 文件用 `git mv` 移动；测试脚本内 `sys.path` 相对路径改一
   - `--no-autolaunch` / `--no-watch`
 - autolaunch：端口 0 时从 20000–60999 随机探测空闲口（20 次，失败回退 OS 分配）；`exec.Command(tailcat, "socks", "--listen=host:port")` 拉起子进程；轮询 TCP 就绪（15s 超时），不就绪则终止子进程并退出码 1。
 - 信号：SIGINT/SIGTERM → 停监听 → 子进程先 `SIGTERM`，5s 不退 `SIGKILL`（复刻 Python atexit + terminate 语义）。
-- 日志：前缀 `[tailcat-dns-proxy]`，格式与 Python 输出一致（listening / mapped 数量 / upstream / relaunched 等）。
+- 日志：前缀 `[tailcat-socks]`，格式与 Python 输出一致（listening / mapped 数量 / upstream / relaunched 等）。
 
 ## Docker
 
@@ -81,8 +81,8 @@ bin/start.sh python   # Python 版
 ```
 
 - 第一个位置参数选版本，缺省 `go`。
-- Go 二进制缺失时自动 `go build -o go/bin/tailcat-dns-proxy ./go`。
-- PID/LOG 按版本分离：`run/tailcat-dns-proxy-{go,python}.pid` / `.log`，两版本可并存但同版本互斥（已有 pid 存活则拒绝启动）。
+- Go 二进制缺失时自动 `go build -o go/bin/tailcat-socks ./go`。
+- PID/LOG 按版本分离：`run/tailcat-socks-{go,python}.pid` / `.log`，两版本可并存但同版本互斥（已有 pid 存活则拒绝启动）。
 - `stop.sh` 同样接受可选版本参数：给参数只停该版本，不给则两个都尝试停。
 - 环境变量 LISTEN / DNS_FILE / UPSTREAM / TAILCAT_BIN / PROXY_ARGS 两版本共用。
 - `restart.sh` 透传版本参数。

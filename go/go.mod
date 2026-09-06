@@ -1,4 +1,4 @@
-module tailcat-dns-proxy
+module tailcat-socks
 
 go 1.25.0
 

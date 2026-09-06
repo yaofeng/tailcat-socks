@@ -3,8 +3,8 @@
 //! to integration tests — hence this file, not unit tests in src/).
 
 use std::time::Duration;
-use tailcat_dns_proxy::config::free_high_port;
-use tailcat_dns_proxy::tailcat::{spawn_socks, terminate, wait_ready};
+use tailcat_socks::config::free_high_port;
+use tailcat_socks::tailcat::{spawn_socks, terminate, wait_ready};
 
 // Mirrors go/main_test.go TestSpawnTailcatSocksAndWaitReady.
 #[tokio::test]

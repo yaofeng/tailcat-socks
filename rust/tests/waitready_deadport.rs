@@ -4,7 +4,7 @@
 //! port made the "dead port" assumption flaky (observed ~1 in 5 runs).
 
 use std::time::Duration;
-use tailcat_dns_proxy::tailcat::wait_ready;
+use tailcat_socks::tailcat::wait_ready;
 
 // wait_ready must keep polling a port that refuses connections and report
 // false at the deadline (guards the timeout() double-Result: the OUTER Ok is

@@ -2,10 +2,10 @@
 //! against the fake-tailcat binary — the same shape as the Go e2e/smoke tests.
 
 use std::time::Duration;
-use tailcat_dns_proxy::config::{free_high_port, join_host_port};
-use tailcat_dns_proxy::dnsmap::{load_dns_file, DnsMap};
-use tailcat_dns_proxy::proxy::Server;
-use tailcat_dns_proxy::tailcat::{spawn_socks, terminate, wait_ready};
+use tailcat_socks::config::{free_high_port, join_host_port};
+use tailcat_socks::dnsmap::{load_dns_file, DnsMap};
+use tailcat_socks::proxy::Server;
+use tailcat_socks::tailcat::{spawn_socks, terminate, wait_ready};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 

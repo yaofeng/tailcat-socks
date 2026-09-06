@@ -4,14 +4,14 @@
 
 **Goal:** 在 `rust/` 下实现与 `python/`、`go/` 行为一致的 SOCKS5 前置代理（域名→tailcat token 改写），tokio 生态、生产可用，并接入 `bin/` 脚本与 README。
 
-**Architecture:** cargo 包 = 薄 `main.rs` + `tailcat_dns_proxy` 库（config/dnsmap/proxy/tailcat/error/logging 六模块）。每连接一个 tokio task；dns 映射 `ArcSwap<HashMap<Vec<u8>, Vec<u8>>>` 原子热替换；relay 用 `select!` 双向泵 + `AtomicU64` 共享空闲钟 + `shutdown(Write)` 半关防 RST。规格：`docs/superpowers/specs/2026-09-05-rust-reimplementation-design.md`。
+**Architecture:** cargo 包 = 薄 `main.rs` + `tailcat_socks` 库（config/dnsmap/proxy/tailcat/error/logging 六模块）。每连接一个 tokio task；dns 映射 `ArcSwap<HashMap<Vec<u8>, Vec<u8>>>` 原子热替换；relay 用 `select!` 双向泵 + `AtomicU64` 共享空闲钟 + `shutdown(Write)` 半关防 RST。规格：`docs/superpowers/specs/2026-09-05-rust-reimplementation-design.md`。
 
 **Tech Stack:** Rust 2021 edition、tokio(net/process/signal/time/macros/io-util/rt-multi-thread)、clap(derive)、arc-swap、tokio-util(CancellationToken)、thiserror、libc(unix, SIGTERM)。
 
 **对规格的四处微调**（规划期锁定，随本计划一并更新规格文档）：
 
 1. 映射类型用 `HashMap<Vec<u8>, Vec<u8>>`（value 也是原始字节），避免 token 经 `from_utf8_lossy` 有损转换后上线（Go 是原样字节转发）。
-2. 新增 `src/lib.rs`（库目标）、`src/logging.rs`（`[tailcat-dns-proxy]` 前缀日志函数）与 `src/tailcat.rs`（子进程拉起/wait_ready/terminate，规格里此职责内含于 main 装配节，独立成模块便于测试）——集成测试经库目标访问内部函数（Rust 惯用法），日志函数被多模块共用。
+2. 新增 `src/lib.rs`（库目标）、`src/logging.rs`（`[tailcat-socks]` 前缀日志函数）与 `src/tailcat.rs`（子进程拉起/wait_ready/terminate，规格里此职责内含于 main 装配节，独立成模块便于测试）——集成测试经库目标访问内部函数（Rust 惯用法），日志函数被多模块共用。
 3. `anyhow` 从依赖中移除：main 的错误路径都是「打固定格式日志 + 退出码 1」，用不上错误冒泡。
 4. `free_high_port` 的 port-0 兜底若也失败则 panic（实践上不可达；不值得为此串 Result，接受与 Go `log.Fatalf` 的退出码差异）。
 
@@ -58,7 +58,7 @@ Expected: `cargo 1.8x.x (...)`、`rustc 1.8x.x`。
 
 ```toml
 [package]
-name = "tailcat-dns-proxy"
+name = "tailcat-socks"
 version = "0.1.0"
 edition = "2021"
 description = "SOCKS5 front proxy that rewrites domains to tailcat tokens (Rust implementation)"
@@ -74,12 +74,12 @@ thiserror = "2"
 libc = "0.2"              # SIGTERM to the tailcat child (tokio only offers SIGKILL)
 ```
 
-说明：`src/lib.rs` 自动成为库目标 `tailcat_dns_proxy`；`src/main.rs` 自动成为 bin `tailcat-dns-proxy`；`src/bin/fake-tailcat.rs`（Task 10）自动成为第二个 bin。集成测试可用 `env!("CARGO_BIN_EXE_fake-tailcat")` 拿其二进制路径。
+说明：`src/lib.rs` 自动成为库目标 `tailcat_socks`；`src/main.rs` 自动成为 bin `tailcat-socks`；`src/bin/fake-tailcat.rs`（Task 10）自动成为第二个 bin。集成测试可用 `env!("CARGO_BIN_EXE_fake-tailcat")` 拿其二进制路径。
 
 - [ ] **Step 2: 创建 src/lib.rs（当前仅两模块，后续任务逐步追加）**
 
 ```rust
-//! tailcat-dns-proxy: a SOCKS5 front proxy that rewrites real domain names to
+//! tailcat-socks: a SOCKS5 front proxy that rewrites real domain names to
 //! tailcat tokens (tc...) and chains to a single standalone `tailcat socks`
 //! upstream. Rust implementation; see README.md for usage.
 
@@ -100,9 +100,9 @@ fn main() {}
 use std::fmt;
 
 /// Log in the exact format the Go/Python versions use:
-/// `[tailcat-dns-proxy] <msg>`, to stderr (bin/start.sh redirects to the log file).
+/// `[tailcat-socks] <msg>`, to stderr (bin/start.sh redirects to the log file).
 pub fn log_line(msg: impl fmt::Display) {
-    eprintln!("[tailcat-dns-proxy] {msg}");
+    eprintln!("[tailcat-socks] {msg}");
 }
 ```
 
@@ -182,7 +182,7 @@ git commit -m "Rust: scaffolding (cargo pkg, error/logging modules, lib+bin targ
 `rust/src/lib.rs` 整体替换为：
 
 ```rust
-//! tailcat-dns-proxy: a SOCKS5 front proxy that rewrites real domain names to
+//! tailcat-socks: a SOCKS5 front proxy that rewrites real domain names to
 //! tailcat tokens (tc...) and chains to a single standalone `tailcat socks`
 //! upstream. Rust implementation; see README.md for usage.
 
@@ -199,7 +199,7 @@ use clap::Parser;
 
 /// CLI flags, identical names/defaults to the Go/Python versions.
 #[derive(Parser, Debug)]
-#[command(name = "tailcat-dns-proxy", about = "SOCKS5 front proxy that rewrites domains to tailcat tokens")]
+#[command(name = "tailcat-socks", about = "SOCKS5 front proxy that rewrites domains to tailcat tokens")]
 pub struct Config {
     /// SOCKS5 listen addr:port
     #[arg(long, default_value = "127.0.0.1:1080")]
@@ -1966,8 +1966,8 @@ async fn serve(mut conn: TcpStream) {
 //! to integration tests — hence this file, not unit tests in src/).
 
 use std::time::Duration;
-use tailcat_dns_proxy::config::free_high_port;
-use tailcat_dns_proxy::tailcat::{spawn_socks, terminate, wait_ready};
+use tailcat_socks::config::free_high_port;
+use tailcat_socks::tailcat::{spawn_socks, terminate, wait_ready};
 
 // Mirrors go/main_test.go TestSpawnTailcatSocksAndWaitReady.
 #[tokio::test]
@@ -2009,7 +2009,7 @@ fn fake_bin() -> String {
 cd rust && cargo test --test autolaunch 2>&1 | tail -5
 ```
 
-Expected: 编译失败，`could not find tailcat in tailcat_dns_proxy`（模块未创建）。
+Expected: 编译失败，`could not find tailcat in tailcat_socks`（模块未创建）。
 
 - [ ] **Step 4: 实现 tailcat.rs + 挂模块，运行确认绿**
 
@@ -2103,10 +2103,10 @@ git commit -m "Rust: tailcat child lifecycle (spawn/wait_ready/terminate) + fake
 //! against the fake-tailcat binary — the same shape as the Go e2e/smoke tests.
 
 use std::time::Duration;
-use tailcat_dns_proxy::config::{free_high_port, join_host_port};
-use tailcat_dns_proxy::dnsmap::{load_dns_file, DnsMap};
-use tailcat_dns_proxy::proxy::Server;
-use tailcat_dns_proxy::tailcat::{spawn_socks, terminate, wait_ready};
+use tailcat_socks::config::{free_high_port, join_host_port};
+use tailcat_socks::dnsmap::{load_dns_file, DnsMap};
+use tailcat_socks::proxy::Server;
+use tailcat_socks::tailcat::{spawn_socks, terminate, wait_ready};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -2210,15 +2210,15 @@ git commit -m "Rust: e2e test through fake-tailcat (autolaunch chain)"
 - [ ] **Step 1: 写完整 main.rs**
 
 ```rust
-//! tailcat-dns-proxy: a SOCKS5 front proxy that rewrites real domain names to
+//! tailcat-socks: a SOCKS5 front proxy that rewrites real domain names to
 //! tailcat tokens (tc...) and chains to a single standalone `tailcat socks`
 //! upstream. Rust implementation of the Python/Go versions; see README.md.
 use clap::Parser;
-use tailcat_dns_proxy::config::{free_high_port, join_host_port, parse_addr, Config};
-use tailcat_dns_proxy::dnsmap::{load_dns_file, token_set, watch, DnsMap};
-use tailcat_dns_proxy::logging::log_line;
-use tailcat_dns_proxy::proxy::Server;
-use tailcat_dns_proxy::tailcat::{spawn_socks, terminate, wait_ready};
+use tailcat_socks::config::{free_high_port, join_host_port, parse_addr, Config};
+use tailcat_socks::dnsmap::{load_dns_file, token_set, watch, DnsMap};
+use tailcat_socks::logging::log_line;
+use tailcat_socks::proxy::Server;
+use tailcat_socks::tailcat::{spawn_socks, terminate, wait_ready};
 use tokio_util::sync::CancellationToken;
 
 fn main() {
@@ -2358,7 +2358,7 @@ cargo build --bins 2>/dev/null
 # 用 fake-tailcat 冒充真 tailcat（端口 127.0.0.1:18099）
 (target/debug/fake-tailcat socks --listen=127.0.0.1:18099 &>/tmp/fake-tailcat.log & echo $! > /tmp/fake-tailcat.pid)
 printf 'tcSMOKE123   smoke.example.com\n' > /tmp/dns-smoke.txt
-(target/debug/tailcat-dns-proxy --listen 127.0.0.1:18098 --dns-file /tmp/dns-smoke.txt --upstream 127.0.0.1:18099 --no-watch &>/tmp/proxy-smoke.log & echo $! > /tmp/proxy-smoke.pid)
+(target/debug/tailcat-socks --listen 127.0.0.1:18098 --dns-file /tmp/dns-smoke.txt --upstream 127.0.0.1:18099 --no-watch &>/tmp/proxy-smoke.log & echo $! > /tmp/proxy-smoke.pid)
 sleep 0.5
 curl -s --socks5-hostname 127.0.0.1:18098 http://smoke.example.com:9999/hello -m 5 | head -c 40; echo
 kill $(cat /tmp/proxy-smoke.pid) $(cat /tmp/fake-tailcat.pid) 2>/dev/null
@@ -2402,9 +2402,9 @@ git commit -m "Rust: main assembly (signals, autolaunch, shutdown order)"
 
 ```bash
   rust)
-    BIN="$ROOT/rust/target/release/tailcat-dns-proxy"
-    PID_FILE="$RUN_DIR/tailcat-dns-proxy-rust.pid"
-    LOG_FILE="$RUN_DIR/tailcat-dns-proxy-rust.log"
+    BIN="$ROOT/rust/target/release/tailcat-socks"
+    PID_FILE="$RUN_DIR/tailcat-socks-rust.pid"
+    LOG_FILE="$RUN_DIR/tailcat-socks-rust.log"
     ;;
 ```
 
@@ -2434,10 +2434,10 @@ fi
 ```bash
 IMPL="${1:-}"
 case "$IMPL" in
-  "")     PID_FILES=("$RUN_DIR/tailcat-dns-proxy-go.pid" "$RUN_DIR/tailcat-dns-proxy-python.pid" "$RUN_DIR/tailcat-dns-proxy-rust.pid") ;;
-  go)     PID_FILES=("$RUN_DIR/tailcat-dns-proxy-go.pid") ;;
-  python) PID_FILES=("$RUN_DIR/tailcat-dns-proxy-python.pid") ;;
-  rust)   PID_FILES=("$RUN_DIR/tailcat-dns-proxy-rust.pid") ;;
+  "")     PID_FILES=("$RUN_DIR/tailcat-socks-go.pid" "$RUN_DIR/tailcat-socks-python.pid" "$RUN_DIR/tailcat-socks-rust.pid") ;;
+  go)     PID_FILES=("$RUN_DIR/tailcat-socks-go.pid") ;;
+  python) PID_FILES=("$RUN_DIR/tailcat-socks-python.pid") ;;
+  rust)   PID_FILES=("$RUN_DIR/tailcat-socks-rust.pid") ;;
   *)      echo "usage: $0 [go|python|rust]" >&2; exit 2 ;;
 esac
 ```
@@ -2446,7 +2446,7 @@ esac
 
 - [ ] **Step 3: is_ours 匹配 rust 二进制**
 
-两个脚本的 `is_ours` 已按 `*tailcat-dns-proxy` 通配匹配，rust 二进制名 `tailcat-dns-proxy` 自然命中，无需改动。验证：
+两个脚本的 `is_ours` 已按 `*tailcat-socks` 通配匹配，rust 二进制名 `tailcat-socks` 自然命中，无需改动。验证：
 
 ```bash
 bash -n bin/start.sh bin/stop.sh bin/restart.sh && echo syntax-ok
@@ -2467,7 +2467,7 @@ Expected: `syntax-ok`。
 (b) 「安装依赖」列表追加：
 
 ```markdown
-- Rust 版:Rust 1.75+(构建用;或直接用已构建的 `rust/target/release/tailcat-dns-proxy`)
+- Rust 版:Rust 1.75+(构建用;或直接用已构建的 `rust/target/release/tailcat-socks`)
 ```
 
 (c) 「快速开始(裸机)」的运行命令区追加：
@@ -2475,7 +2475,7 @@ Expected: `syntax-ok`。
 ```bash
 # Rust 版(推荐:先构建一次)
 cd rust && cargo build --release && cd ..
-rust/target/release/tailcat-dns-proxy
+rust/target/release/tailcat-socks
 ```
 
 以及 `bin/start.sh` 用法注释区追加一行：
@@ -2484,7 +2484,7 @@ rust/target/release/tailcat-dns-proxy
 bin/start.sh rust       # 后台启动 Rust 版
 ```
 
-(d) 「启停脚本」节的文件名清单加 rust：`run/tailcat-dns-proxy-{go,python,rust}.{pid,log}`；用法块加 `bin/stop.sh rust` 与 `bin/restart.sh rust`。
+(d) 「启停脚本」节的文件名清单加 rust：`run/tailcat-socks-{go,python,rust}.{pid,log}`；用法块加 `bin/stop.sh rust` 与 `bin/restart.sh rust`。
 
 (e) 「目录结构」树在 `go/` 之后插入：
 
@@ -2525,7 +2525,7 @@ cd rust && cargo test                # Rust 版:解析/改写/热加载/端到�
 │   │   ├── proxy.rs       # Server / SOCKS5 服务端 / 上游握手 / relay
 │   │   ├── tailcat.rs     # spawn_socks / wait_ready / terminate
 │   │   ├── error.rs       # thiserror 错误类型
-│   │   ├── logging.rs     # [tailcat-dns-proxy] 前缀日志
+│   │   ├── logging.rs     # [tailcat-socks] 前缀日志
 │   │   └── bin/fake-tailcat.rs  # 测试用假 tailcat（cargo bin 目标）
 ```
 
@@ -2542,7 +2542,7 @@ Expected: fmt 无 diff（或 `cargo fmt` 一遍后归零）；clippy 无告警�
 - [ ] **Step 7: 真机冒烟（bin 脚本 + 热加载）**
 
 ```bash
-bin/stop.sh rust 2>/dev/null; bin/start.sh rust && sleep 1 && tail -5 run/tailcat-dns-proxy-rust.log && bin/stop.sh rust
+bin/stop.sh rust 2>/dev/null; bin/start.sh rust && sleep 1 && tail -5 run/tailcat-socks-rust.log && bin/stop.sh rust
 ```
 
 Expected: start 输出 `started [rust] pid …`，日志含 `listening socks5h://…`、`N domain(s) mapped -> M token(s)`（dns.txt 已存在），stop 输出 `stopped`。
@@ -2554,7 +2554,7 @@ cp dns.txt /tmp/dns-hot.txt
 DNS_FILE=/tmp/dns-hot.txt bin/start.sh rust && sleep 1
 printf 'tcHotReload hot.example.org\n' >> /tmp/dns-hot.txt
 sleep 2
-grep reloaded run/tailcat-dns-proxy-rust.log
+grep reloaded run/tailcat-socks-rust.log
 bin/stop.sh rust && rm -f /tmp/dns-hot.txt
 ```
 
