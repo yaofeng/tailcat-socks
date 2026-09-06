@@ -21,7 +21,7 @@ import (
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)).With("component", "tailcat-dns-proxy"))
 	var (
 		listen       = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen addr:port")
 		dnsFile      = flag.String("dns-file", "dns.txt", "domain->token mapping file")
@@ -102,7 +102,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	host, port, _ := net.SplitHostPort(srv.ActualAddr().String())
 	slog.Info("listening", "url", "socks5h://"+net.JoinHostPort(host, port))
 	slog.Info("dns map loaded", "domains", len(first), "tokens", len(tokenSet(first)))
-	slog.Info("upstream", "addr", upAddr)
+	slog.Info("using upstream", "addr", upAddr)
 
 	select {
 	case <-sig:
