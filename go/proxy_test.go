@@ -628,6 +628,36 @@ func TestSocks5ProxyForwardsIPv6AsATYP4(t *testing.T) {
 	}
 }
 
+// TestSocks5ProxyHandshakeIdleClosesSlowClient: a client that connects but
+// never advances the handshake must be dropped once the handshake deadline
+// expires, instead of pinning a goroutine+fd forever.
+func TestSocks5ProxyHandshakeIdleClosesSlowClient(t *testing.T) {
+	var got atomic.Int64
+	up := silentUpstream(t, &got) // completes handshakes it is asked for; here it is never reached
+	srv := newProxy(t, map[string]string{}, up)
+	srv.handshakeTimeout = 200 * time.Millisecond
+	go srv.Serve()
+
+	conn, err := net.Dial("tcp", srv.ActualAddr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	start := time.Now()
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	n, err := conn.Read(buf)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("slow client closed after %v, want ~handshakeTimeout (200ms)", elapsed)
+	}
+	if err == nil {
+		t.Fatalf("silent client got data (%d bytes) instead of being dropped", n)
+	}
+}
+
 // TestSocks5ProxyUpstreamDialFailureRepliesFail: when the upstream is
 // unreachable the client must get the generic failure reply.
 func TestSocks5ProxyUpstreamDialFailureRepliesFail(t *testing.T) {

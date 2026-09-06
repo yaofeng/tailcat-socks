@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -17,6 +19,10 @@ const (
 	// 300s with no reads of real bytes in either direction (only reads
 	// re-arm the window; writes never do).
 	relayIdleTimeout = 300 * time.Second
+	// handshakeTimeout bounds the client-facing SOCKS5 handshake (greeting,
+	// request parse, upstream CONNECT, and our reply) so a silent or stalled
+	// client cannot pin a goroutine and fd forever. Cleared before relaying.
+	handshakeTimeout = 15 * time.Second
 )
 
 // SOCKS5 success/failure replies (BOUND.ADDR 0.0.0.0:0, as in Python).
@@ -35,6 +41,9 @@ type Server struct {
 	// relayIdle is how long the relay tolerates silence in either direction
 	// before tearing the session down.
 	relayIdle time.Duration
+	// handshakeTimeout bounds the client-facing SOCKS5 handshake; see the
+	// const.
+	handshakeTimeout time.Duration
 }
 
 // NewServer binds the listen address. Use ActualAddr for the resolved port
@@ -44,7 +53,7 @@ func NewServer(dnsMap *DNSMap, upstreamAddr, listen string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{DNSMap: dnsMap, UpstreamAddr: upstreamAddr, ln: ln, relayIdle: relayIdleTimeout}, nil
+	return &Server{DNSMap: dnsMap, UpstreamAddr: upstreamAddr, ln: ln, relayIdle: relayIdleTimeout, handshakeTimeout: handshakeTimeout}, nil
 }
 
 // ActualAddr returns the bound address once NewServer has succeeded.
@@ -54,13 +63,34 @@ func (s *Server) ActualAddr() net.Addr { return s.ln.Addr() }
 func (s *Server) Close() error { return s.ln.Close() }
 
 // Serve accepts connections until the listener closes; each connection is
-// handled on its own goroutine.
+// handled on its own goroutine. Transient accept errors back off exponentially
+// (net/http's pattern) instead of ending the loop; net.ErrClosed is the normal
+// shutdown path and any other error stops Serve (a genuinely broken listener
+// should not spin here).
 func (s *Server) Serve() error {
+	var tempDelay time.Duration
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
+			if errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				slog.Warn("accept failed; backing off", "err", err, "retry_in", tempDelay)
+				time.Sleep(tempDelay)
+				continue
+			}
 			return err
 		}
+		tempDelay = 0
 		go s.handle(conn)
 	}
 }
@@ -70,11 +100,19 @@ func (s *Server) handle(conn net.Conn) {
 	s.serveConn(conn)
 }
 
-func socksFail(client net.Conn) { client.Write(socksFailReply) }
+func socksFail(client net.Conn) {
+	// Best-effort: the client may already be gone; there is nothing useful
+	// to do with a write error on a reply.
+	_, _ = client.Write(socksFailReply)
+}
 
 // serveConn runs the SOCKS5 exchange on one connection, mirroring the Python
 // version byte-for-byte (greeting, CONNECT-only, ATYP 1/3/4, socks5h).
 func (s *Server) serveConn(client net.Conn) {
+	// Bound the whole handshake through the OK/fail reply below; the early
+	// return paths keep it armed — we close the conn right after anyway.
+	client.SetDeadline(time.Now().Add(s.handshakeTimeout))
+
 	// --- greeting ---
 	var v [1]byte
 	if _, err := io.ReadFull(client, v[:]); err != nil {
@@ -99,7 +137,7 @@ func (s *Server) serveConn(client net.Conn) {
 		}
 	}
 	if !noAuth {
-		client.Write([]byte{0x05, 0xFF}) // no acceptable methods
+		_, _ = client.Write([]byte{0x05, 0xFF}) // no acceptable methods; best-effort like the other replies
 		return
 	}
 	if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
@@ -137,9 +175,12 @@ func (s *Server) serveConn(client net.Conn) {
 		socksFail(client)
 		return
 	}
-	up.SetDeadline(time.Time{}) // relay phase: shared idle timeout only (dialUpstream hands back a deadline-free conn)
+	// Still under the handshake deadline: best-effort, but not unbounded.
+	_, _ = client.Write(socksOKReply)
 
-	client.Write(socksOKReply)
+	// Handshake over; relay's idle timer governs both legs from here.
+	client.SetDeadline(time.Time{})
+	up.SetDeadline(time.Time{})    // dialUpstream hands back a deadline-free conn; kept for clarity
 	relay(client, up, s.relayIdle) // relay owns both conns and closes them
 }
 
