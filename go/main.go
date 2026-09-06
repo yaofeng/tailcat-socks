@@ -9,13 +9,11 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -23,9 +21,9 @@ import (
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)).With("component", "tailcat-dns-proxy"))
 	var (
-		listen       = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen addr:port")
+		listen       = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address (host:port; empty host binds all interfaces)")
 		dnsFile      = flag.String("dns-file", "dns.txt", "domain->token mapping file")
-		upstream     = flag.String("upstream", "127.0.0.1:0", "upstream tailcat socks addr:port; port 0 (default) = high random free port")
+		upstream     = flag.String("upstream", "127.0.0.1:0", "upstream tailcat socks address (host:port; port 0 = OS-assigned free port)")
 		tailcatBin   = flag.String("tailcat-bin", "tailcat", "path to tailcat binary (auto-launched)")
 		noAutolaunch = flag.Bool("no-autolaunch", false, "do not spawn tailcat socks; use an already-running upstream")
 		noWatch      = flag.Bool("no-watch", false, "disable dns.txt hot-reload")
@@ -48,26 +46,27 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	dnsMap := &DNSMap{}
 	dnsMap.Store(first)
 
-	// Normalize --listen with Python's parse_addr semantics: a bare port or an
-	// empty host means loopback, so ":8080" cannot bind every interface, and
-	// bracketed IPv6 comes out well-formed for net.Listen.
-	lHost, lPort, err := parseAddr(listen, 0)
+	// Validate --listen as a proper host:port. An empty host (":8080") binds
+	// every interface; bracketed IPv6 comes out well-formed for net.Listen.
+	lHost, lPort, err := net.SplitHostPort(listen)
 	if err != nil {
+		err = fmt.Errorf("bad --listen %q: %w (want host:port)", listen, err)
 		slog.Error("bad --listen", "err", err)
 		return 1
 	}
-	listen = net.JoinHostPort(strings.Trim(lHost, "[]"), strconv.Itoa(lPort))
+	listen = net.JoinHostPort(lHost, lPort)
 
-	// Resolve the tailcat socks listen port: explicit port wins, else high random.
-	upHost, upPort, err := parseAddr(upstream, 0)
+	// Resolve the upstream tailcat socks address: explicit port wins, port 0
+	// gets an OS-assigned free port.
+	upAddr, err := upstreamAddr(upstream)
 	if err != nil {
 		slog.Error("bad --upstream", "err", err)
 		return 1
 	}
-	if upPort == 0 {
-		upPort = freeHighPort(strings.Trim(upHost, "[]"))
-	}
-	upAddr := net.JoinHostPort(strings.Trim(upHost, "[]"), strconv.Itoa(upPort))
+	// upstreamAddr always returns a well-formed host:port, so these splits
+	// cannot fail; we only need the parts back for the child's --listen flag.
+	upHost, upPortStr, _ := net.SplitHostPort(upAddr)
+	upPort, _ := strconv.Atoi(upPortStr)
 
 	srv, err := NewServer(dnsMap, upAddr, listen)
 	if err != nil {
@@ -119,46 +118,28 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	return 0
 }
 
-// parseAddr splits "host:port" with Python's rpartition(":") semantics:
-// everything after the last colon is the port, everything before is the host
-// (empty -> 127.0.0.1); a string with no colon is treated as the port part.
-func parseAddr(s string, defaultPort int) (string, int, error) {
-	host, portStr := "", s // no colon: Python rpartition puts the whole string in the port part
-	if i := strings.LastIndex(s, ":"); i >= 0 {
-		host, portStr = s[:i], s[i+1:]
+// upstreamAddr validates the --upstream flag value and returns the address to
+// dial. A port of 0 asks the OS for a free port and returns the concrete
+// address that was probed (there is an unavoidable race between probe and
+// dial, accepted because the window is tiny and failure is reported normally).
+func upstreamAddr(s string) (string, error) {
+	host, portStr, err := net.SplitHostPort(s)
+	if err != nil {
+		return "", fmt.Errorf("bad --upstream %q: %w (want host:port)", s, err)
 	}
-	port := defaultPort
-	if portStr != "" {
-		p, err := strconv.Atoi(portStr)
-		if err != nil {
-			return "", 0, fmt.Errorf("bad addr %q: %w", s, err)
-		}
-		port = p
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", fmt.Errorf("bad --upstream %q: %w", s, err)
 	}
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	return host, port, nil
-}
-
-// freeHighPort returns a free high port (ephemeral range, randomly probed,
-// mirroring the Python version), falling back to an OS-assigned port.
-func freeHighPort(host string) int {
-	for i := 0; i < 20; i++ {
-		p := 20000 + rand.Intn(41000) // 20000..60999
-		ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(p)))
-		if err == nil {
-			ln.Close()
-			return p
-		}
+	if port != 0 {
+		return net.JoinHostPort(host, strconv.Itoa(port)), nil
 	}
 	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
 	if err != nil {
-		slog.Error("cannot find a free port", "err", err)
-		os.Exit(1)
+		return "", fmt.Errorf("pick free port on %q: %w", host, err)
 	}
 	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	return ln.Addr().String(), nil
 }
 
 // spawnTailcatSocks launches `tailcat socks --listen=host:port` and returns

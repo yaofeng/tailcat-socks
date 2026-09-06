@@ -32,55 +32,57 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func TestParseAddr(t *testing.T) {
-	cases := []struct {
-		in       string
-		def      int
-		wantHost string
-		wantPort int
-		wantErr  bool
-	}{
-		{"127.0.0.1:1080", 0, "127.0.0.1", 1080, false},
-		{":8080", 0, "127.0.0.1", 8080, false},
-		{"127.0.0.1:0", 0, "127.0.0.1", 0, false},
-		{"example.com:9999", 0, "example.com", 9999, false},
-		{"[::1]:1080", 0, "[::1]", 1080, false},
-		{"1080", 0, "127.0.0.1", 1080, false}, // bare port, empty host -> default
-		{"127.0.0.1", 0, "", 0, true},         // bare IP -> Atoi fails (parity with Python)
-		{"host:abc", 0, "", 0, true},
+func TestUpstreamAddr(t *testing.T) {
+	// Explicit port is preserved verbatim.
+	got, err := upstreamAddr("127.0.0.1:9999")
+	if err != nil {
+		t.Fatalf(`upstreamAddr("127.0.0.1:9999"): %v`, err)
 	}
-	for _, tc := range cases {
-		host, port, err := parseAddr(tc.in, tc.def)
-		if tc.wantErr {
-			if err == nil {
-				t.Errorf("parseAddr(%q): want error, got %s:%d", tc.in, host, port)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("parseAddr(%q): %v", tc.in, err)
-			continue
-		}
-		if host != tc.wantHost || port != tc.wantPort {
-			t.Errorf("parseAddr(%q) = %s:%d, want %s:%d", tc.in, host, port, tc.wantHost, tc.wantPort)
+	if got != "127.0.0.1:9999" {
+		t.Errorf(`upstreamAddr("127.0.0.1:9999") = %q, want "127.0.0.1:9999"`, got)
+	}
+
+	// Port 0 asks the OS for a free port and returns a concrete address.
+	got, err = upstreamAddr("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf(`upstreamAddr("127.0.0.1:0"): %v`, err)
+	}
+	host, portStr, err := net.SplitHostPort(got)
+	if err != nil {
+		t.Fatalf("upstreamAddr(\"127.0.0.1:0\") = %q: SplitHostPort: %v", got, err)
+	}
+	if host != "127.0.0.1" {
+		t.Errorf("host = %q, want 127.0.0.1", host)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("port %q in %q is not numeric: %v", portStr, got, err)
+	}
+	if port < 1 || port > 65535 {
+		t.Errorf("port %d out of range 1..65535", port)
+	}
+
+	// Malformed inputs are rejected.
+	for _, bad := range []string{"127.0.0.1", ":0x22", "[::1]", "::1", "host:abc"} {
+		if _, err := upstreamAddr(bad); err == nil {
+			t.Errorf("upstreamAddr(%q): want error, got nil", bad)
 		}
 	}
 }
 
-func TestFreeHighPort(t *testing.T) {
-	p := freeHighPort("127.0.0.1")
-	if p < 20000 || p > 60999 {
-		t.Fatalf("port %d out of high range", p)
+// freePort asks the OS for a free loopback port by briefly binding :0.
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve free port: %v", err)
 	}
-	// typically still bindable right after
-	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
-	if err == nil {
-		ln.Close()
-	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
 }
 
 func TestSpawnTailcatSocksAndWaitReady(t *testing.T) {
-	port := freeHighPort("127.0.0.1")
+	port := freePort(t)
 	child := spawnTailcatSocks(fakeTailcatBin, "127.0.0.1", port)
 	if child == nil {
 		t.Fatal("spawn failed")
@@ -92,7 +94,7 @@ func TestSpawnTailcatSocksAndWaitReady(t *testing.T) {
 }
 
 func TestTerminateStopsChild(t *testing.T) {
-	port := freeHighPort("127.0.0.1")
+	port := freePort(t)
 	child := spawnTailcatSocks(fakeTailcatBin, "127.0.0.1", port)
 	if child == nil {
 		t.Fatal("spawn failed")
