@@ -14,7 +14,8 @@ import (
 const (
 	upstreamDialTimeout = 15 * time.Second
 	// relayIdleTimeout mirrors the Python version: the relay breaks after
-	// 300s with no data in either direction.
+	// 300s with no reads of real bytes in either direction (only reads
+	// re-arm the window; writes never do).
 	relayIdleTimeout = 300 * time.Second
 )
 
@@ -272,10 +273,18 @@ func socksClientConnect(ctx context.Context, conn net.Conn, req []byte) error {
 // download with no client upload) is never killed as idle. When the timer
 // fires, or both directions have ended, the connection is torn down with
 // half-closes (FIN first) so the peers see clean EOF instead of RST.
+//
+// This deliberately diverges from Python's _relay (and from the old Go
+// relay), which tore down BOTH legs on the first empty recv: here the
+// surviving direction gets to finish. The cost of letting it — the price of
+// the forward half-close property — is that a peer which half-closes and
+// then falls silent keeps the relay (both goroutines plus the timer) alive
+// for up to the full idle window.
 func relay(client, upstream net.Conn, idle time.Duration) {
 	var once sync.Once
-	// stop closes the RAW conns: halfClose's *net.TCPConn assertion must not
-	// see the idleConn wrappers below.
+	// stop closes the conns relay was handed; halfClose reaches the socket
+	// through tcpOf, which unwraps the idleConn wrappers below, so the
+	// teardown works on wrapped or raw conns alike.
 	stop := func() {
 		// The peer's socket may still hold unread bytes in our kernel receive
 		// queue; a plain Close there makes Linux send RST instead of FIN
@@ -316,6 +325,12 @@ func relay(client, upstream net.Conn, idle time.Duration) {
 }
 
 // idleConn counts real bytes as activity, re-arming the shared idle timer.
+//
+// WARNING: do not "optimize" the relay's io.Copy by giving idleConn a
+// ReadFrom that delegates to the raw conn (or by copying with the raw conns
+// instead): the splice fast path would bypass Read entirely, reads would
+// stop re-arming the idle timer, and long transfers would be killed as idle.
+// Every byte the relay reads must pass through idleConn.Read.
 type idleConn struct {
 	net.Conn
 	onActivity func()
@@ -329,12 +344,19 @@ func (c *idleConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// closeWrite sends FIN on the TCP connection, whether wrapped or raw.
-func closeWrite(conn net.Conn) {
+// tcpOf returns the *net.TCPConn behind conn, unwrapping an idleConn
+// wrapper first; it returns nil for any non-TCP conn.
+func tcpOf(conn net.Conn) *net.TCPConn {
 	if c, ok := conn.(*idleConn); ok {
 		conn = c.Conn
 	}
-	if tc, ok := conn.(*net.TCPConn); ok {
+	tc, _ := conn.(*net.TCPConn)
+	return tc
+}
+
+// closeWrite sends FIN on the TCP connection, whether wrapped or raw.
+func closeWrite(conn net.Conn) {
+	if tc := tcpOf(conn); tc != nil {
 		tc.CloseWrite()
 	}
 }
@@ -347,10 +369,11 @@ func closeWrite(conn net.Conn) {
 // drops further input, at the same cost Python pays: data the peer sends in
 // the window before Close earns the peer an RST. Errors are ignored on
 // purpose, like Python's `except OSError: pass` around the shutdowns. Non-TCP
-// conns have no such half-close; leave them for Close.
+// conns have no such half-close; leave them for Close. tcpOf unwraps the
+// relay's idleConn, so halfClose works on wrapped or raw conns alike.
 func halfClose(conn net.Conn) {
-	tc, ok := conn.(*net.TCPConn)
-	if !ok {
+	tc := tcpOf(conn)
+	if tc == nil {
 		return
 	}
 	tc.CloseWrite() // FIN to the peer, like shutdown(SHUT_WR)
