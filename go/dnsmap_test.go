@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -87,20 +88,15 @@ func TestRewriteHost(t *testing.T) {
 func TestWatchDNSFileReloads(t *testing.T) {
 	path := writeTemp(t, "tcA alpha.com\n")
 	m := &DNSMap{}
-	stop := make(chan struct{})
-	defer close(stop)
-	go WatchDNSFile(path, m, 50*time.Millisecond, stop)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go WatchDNSFile(ctx, path, m)
 
 	// initial load
 	waitFor(t, 3*time.Second, func() bool { return m.Load()["alpha.com"] == "tcA" })
 
-	// rewrite content and bump mtime explicitly (some filesystems have
-	// coarse mtime granularity, which would miss the change)
+	// fsnotify fires on the content write itself; no mtime bump needed
 	if err := os.WriteFile(path, []byte("tcB beta.com\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	future := time.Now().Add(2 * time.Second)
-	if err := os.Chtimes(path, future, future); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 3*time.Second, func() bool { return m.Load()["beta.com"] == "tcB" })
@@ -124,12 +120,12 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 func TestWatchDNSFileKeepsPreviousMapOnReadError(t *testing.T) {
 	path := writeTemp(t, "tcA keep.com\n")
 	m := &DNSMap{}
-	stop := make(chan struct{})
-	defer close(stop)
-	go WatchDNSFile(path, m, 50*time.Millisecond, stop)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go WatchDNSFile(ctx, path, m)
 	waitFor(t, 3*time.Second, func() bool { return m.Load()["keep.com"] == "tcA" })
 
-	// Make reads fail while stat still succeeds: replace the file with a directory.
+	// Make reads fail while events keep coming: replace the file with a directory.
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}

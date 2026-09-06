@@ -138,9 +138,8 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 		slog.Info("auto-launched tailcat socks", "bin", tailcatBin, "addr", upAddr)
 	}
 
-	stopWatch := make(chan struct{})
 	if !noWatch {
-		go WatchDNSFile(dnsFile, dnsMap, time.Second, stopWatch)
+		go WatchDNSFile(ctx, dnsFile, dnsMap)
 	}
 
 	serveErr := make(chan error, 1)
@@ -183,8 +182,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 			code = 1
 		}
 	}
-	cancel() // stops the child if alive: SIGTERM, then SIGKILL; harmless without one
-	close(stopWatch)
+	cancel() // stops the child if alive: SIGTERM, then SIGKILL; also stops the dns watcher
 	srv.Close()
 	if child != nil {
 		<-childDone // reap the child before exiting so it cannot outlive us
