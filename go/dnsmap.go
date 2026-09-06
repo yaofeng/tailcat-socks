@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -73,7 +73,7 @@ func WatchDNSFile(path string, m *DNSMap, interval time.Duration, stop <-chan st
 		m.Store(first)
 	} else {
 		lastMod = time.Time{} // retry the initial load on every tick (mtime != lastMod)
-		log.Printf("[tailcat-dns-proxy] initial load of %s failed: %v", path, err)
+		slog.Warn("initial dns load failed; retrying", "path", path, "err", err)
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -89,13 +89,12 @@ func WatchDNSFile(path string, m *DNSMap, interval time.Duration, stop <-chan st
 		}
 		newMap, err := LoadDNSFile(path)
 		if err != nil {
-			log.Printf("[tailcat-dns-proxy] reload failed (%v); keeping previous map", err)
+			slog.Warn("dns reload failed; keeping previous map", "path", path, "err", err)
 			continue
 		}
 		lastMod = fi.ModTime()
 		m.Store(newMap)
-		log.Printf("[tailcat-dns-proxy] reloaded %s: %d domain(s) -> %d token(s)",
-			path, len(newMap), len(tokenSet(newMap)))
+		slog.Info("dns map reloaded", "path", path, "domains", len(newMap), "tokens", len(tokenSet(newMap)))
 	}
 }
 

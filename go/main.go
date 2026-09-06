@@ -8,7 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"os"
@@ -21,7 +21,7 @@ import (
 )
 
 func main() {
-	log.SetFlags(0) // messages already carry the [tailcat-dns-proxy] prefix
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	var (
 		listen       = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen addr:port")
 		dnsFile      = flag.String("dns-file", "dns.txt", "domain->token mapping file")
@@ -42,7 +42,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 
 	first, err := LoadDNSFile(dnsFile)
 	if err != nil {
-		log.Printf("[tailcat-dns-proxy] cannot load %s: %v", dnsFile, err)
+		slog.Error("cannot load dns file", "path", dnsFile, "err", err)
 		return 1
 	}
 	dnsMap := &DNSMap{}
@@ -53,7 +53,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	// bracketed IPv6 comes out well-formed for net.Listen.
 	lHost, lPort, err := parseAddr(listen, 0)
 	if err != nil {
-		log.Printf("[tailcat-dns-proxy] bad --listen: %v", err)
+		slog.Error("bad --listen", "err", err)
 		return 1
 	}
 	listen = net.JoinHostPort(strings.Trim(lHost, "[]"), strconv.Itoa(lPort))
@@ -61,7 +61,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	// Resolve the tailcat socks listen port: explicit port wins, else high random.
 	upHost, upPort, err := parseAddr(upstream, 0)
 	if err != nil {
-		log.Printf("[tailcat-dns-proxy] bad --upstream: %v", err)
+		slog.Error("bad --upstream", "err", err)
 		return 1
 	}
 	if upPort == 0 {
@@ -71,7 +71,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 
 	srv, err := NewServer(dnsMap, upAddr, listen)
 	if err != nil {
-		log.Printf("[tailcat-dns-proxy] cannot listen on %s: %v", listen, err)
+		slog.Error("cannot listen", "addr", listen, "err", err)
 		return 1
 	}
 
@@ -83,12 +83,12 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 			return 1
 		}
 		if !waitReady(upAddr, 15*time.Second) {
-			log.Printf("[tailcat-dns-proxy] upstream %s not ready; aborting", upAddr)
+			slog.Error("upstream not ready; aborting", "addr", upAddr)
 			terminate(child)
 			srv.Close()
 			return 1
 		}
-		log.Printf("[tailcat-dns-proxy] auto-launched %s socks on %s", tailcatBin, upAddr)
+		slog.Info("auto-launched tailcat socks", "bin", tailcatBin, "addr", upAddr)
 	}
 
 	stopWatch := make(chan struct{})
@@ -100,10 +100,9 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	go func() { serveErr <- srv.Serve() }()
 
 	host, port, _ := net.SplitHostPort(srv.ActualAddr().String())
-	log.Printf("[tailcat-dns-proxy] listening socks5h://%s:%s", host, port)
-	log.Printf("[tailcat-dns-proxy] %d domain(s) mapped -> %d token(s)",
-		len(first), len(tokenSet(first)))
-	log.Printf("[tailcat-dns-proxy] upstream %s", upAddr)
+	slog.Info("listening", "url", "socks5h://"+net.JoinHostPort(host, port))
+	slog.Info("dns map loaded", "domains", len(first), "tokens", len(tokenSet(first)))
+	slog.Info("upstream", "addr", upAddr)
 
 	select {
 	case <-sig:
@@ -111,7 +110,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 		// srv.Close() during shutdown makes Serve() report net.ErrClosed;
 		// that is not a real failure, so keep signal exits quiet.
 		if err != nil && !errors.Is(err, net.ErrClosed) {
-			log.Printf("[tailcat-dns-proxy] server error: %v", err)
+			slog.Error("server error", "err", err)
 		}
 	}
 	close(stopWatch)
@@ -155,7 +154,8 @@ func freeHighPort(host string) int {
 	}
 	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
 	if err != nil {
-		log.Fatalf("[tailcat-dns-proxy] cannot find a free port: %v", err)
+		slog.Error("cannot find a free port", "err", err)
+		os.Exit(1)
 	}
 	defer ln.Close()
 	return ln.Addr().(*net.TCPAddr).Port
@@ -169,7 +169,7 @@ func spawnTailcatSocks(binPath, host string, port int) *exec.Cmd {
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		log.Printf("[tailcat-dns-proxy] failed to launch %s: %v", binPath, err)
+		slog.Error("failed to launch tailcat socks", "bin", binPath, "err", err)
 		return nil
 	}
 	return cmd
