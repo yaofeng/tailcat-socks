@@ -128,11 +128,11 @@ docker compose down
 
 ## dns.txt 热加载
 
-代理默认每秒轮询 `dns.txt` 的 mtime,变化即重新载入(原子替换内存映射)。读取失败时保留旧映射并打警告。改完文件存盘即生效,无需重启;`--no-watch` 关闭。
+代理监听 `dns.txt` 变化即重新载入(原子替换内存映射):Go 版用 fsnotify 文件事件,Python/Rust 版每秒轮询 mtime。读取失败时保留旧映射并打警告。改完文件存盘即生效,无需重启;`--no-watch` 关闭。
 
 ## tailcat socks 端口
 
-默认 `--upstream` 端口为 `0`,代理从 `20000–60999` 随机挑一个空闲的高位端口给 tailcat socks。也可 `--upstream 127.0.0.1:1081` 固定。
+默认 `--upstream` 端口为 `0`:Go 版由操作系统分配空闲端口,Python/Rust 版从 `20000–60999` 随机探测一个空闲高位端口给 tailcat socks。也可 `--upstream 127.0.0.1:1081` 固定。
 
 ## 目录结构
 
@@ -141,7 +141,7 @@ tailcat-dns-proxy/
 ├── python/
 │   ├── tailcat_dns_proxy.py          # Python 版代理主体(纯标准库)
 │   └── tests/test_tailcat_dns_proxy.py
-├── go/                               # Go 复刻版(行为一致)
+├── go/                               # Go 版(idiomatic Go 重写;fsnotify 热加载)
 │   ├── main.go                       # flag / tailcat 自动拉起 / 信号
 │   ├── dnsmap.go                     # dns.txt 解析 + 原子热加载
 │   ├── proxy.go                      # SOCKS5 服务端 + 上游握手 + relay
