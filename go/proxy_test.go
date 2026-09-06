@@ -29,29 +29,47 @@ func fakeUpstream(t *testing.T, received chan<- string) string {
 			return
 		}
 		defer conn.Close()
+		// The received channel records only ACCEPTED, fully parsed CONNECTs:
+		// a client that opens the connection and closes it mid-handshake (e.g.
+		// rejecting an over-long FQDN before sending the request) must leave
+		// nothing on the channel, so every read failure returns here.
 		hdr := make([]byte, 2)
-		io.ReadFull(conn, hdr)
-		io.ReadFull(conn, make([]byte, hdr[1]))
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			return
+		}
+		if _, err := io.ReadFull(conn, make([]byte, hdr[1])); err != nil {
+			return
+		}
 		conn.Write([]byte{0x05, 0x00})
 		req := make([]byte, 4)
-		io.ReadFull(conn, req)
+		if _, err := io.ReadFull(conn, req); err != nil {
+			return
+		}
 		var host string
 		switch req[3] {
 		case 0x03:
 			l := make([]byte, 1)
-			io.ReadFull(conn, l)
+			if _, err := io.ReadFull(conn, l); err != nil {
+				return
+			}
 			b := make([]byte, l[0])
-			io.ReadFull(conn, b)
+			if _, err := io.ReadFull(conn, b); err != nil {
+				return
+			}
 			host = string(b)
 		case 0x01:
 			b := make([]byte, 4)
-			io.ReadFull(conn, b)
+			if _, err := io.ReadFull(conn, b); err != nil {
+				return
+			}
 			host = net.IP(b).String()
 		default:
 			host = "?"
 		}
 		pb := make([]byte, 2)
-		io.ReadFull(conn, pb)
+		if _, err := io.ReadFull(conn, pb); err != nil {
+			return
+		}
 		received <- net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(pb))))
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		buf := make([]byte, 4096)
@@ -243,66 +261,6 @@ func TestSocks5ProxyNoAcceptableMethod(t *testing.T) {
 	case got := <-received:
 		t.Errorf("upstream must not receive anything, got %q", got)
 	default:
-	}
-}
-
-func TestUpstreamConnectUsesDomainATYP(t *testing.T) {
-	// A raw TCP listener that captures the upstream request bytes.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	type result struct {
-		data []byte
-	}
-	ch := make(chan result, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		conn.Write([]byte{0x05, 0x00})
-		// Read exactly the greeting (3) plus the full CONNECT request
-		// (VER,CMD,RSV,ATYP + len + host + port = 4+1+11+2 for
-		// "tcXYZabc123":443). A single short Read would race with
-		// upstreamConnect, which can only send the request after receiving
-		// our 05 00 reply.
-		buf := make([]byte, 3+4+1+len("tcXYZabc123")+2)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			t.Logf("capture: %v", err)
-		}
-		ch <- result{data: buf}
-	}()
-
-	up, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer up.Close()
-	if err := upstreamConnect(up, "tcXYZabc123", 443); err != nil {
-		// The fake never sends the final reply, so upstreamConnect returns
-		// only once the capture goroutine finishes and its deferred Close
-		// EOFs the reply read. The request bytes are already captured and
-		// asserted below.
-		t.Logf("upstreamConnect: %v", err)
-	}
-	select {
-	case r := <-ch:
-		got := r.data
-		if len(got) < 3 || string(got[:3]) != "\x05\x01\x00" {
-			t.Fatalf("bad greeting bytes: %v", got)
-		}
-		// full request: VER,CMD,RSV,ATYP + len + host + big-endian port
-		want := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len("tcXYZabc123"))}, []byte("tcXYZabc123")...)
-		want = append(want, 0x01, 0xBB) // 443
-		req := got[3:]
-		if string(req) != string(want) {
-			t.Errorf("request = %v, want %v", req, want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no request captured")
 	}
 }
 
@@ -567,6 +525,45 @@ func TestSocks5ProxyUpstreamDialFailureRepliesFail(t *testing.T) {
 	}
 	if want := []byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0}; !bytes.Equal(head, want) {
 		t.Errorf("reply = %v, want %v", head, want)
+	}
+}
+
+// TestSocks5ProxyOversizedTokenFailsConnect: a rewritten token longer than
+// the 255-byte SOCKS5 domain field must fail the CONNECT. The hand-rolled
+// upstream encoder wrapped the length byte (byte(300) == 44) and silently
+// shipped a truncated token upstream; x/net must reject the over-long FQDN
+// before any CONNECT byte reaches the upstream.
+func TestSocks5ProxyOversizedTokenFailsConnect(t *testing.T) {
+	received := make(chan string, 1)
+	up := fakeUpstream(t, received)
+	srv := startProxy(t, map[string]string{"big.example": strings.Repeat("t", 300)}, up)
+
+	c, err := net.DialTimeout("tcp", srv.ActualAddr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte{0x05, 0x01, 0x00})
+	rep := make([]byte, 2)
+	if _, err := io.ReadFull(c, rep); err != nil {
+		t.Fatalf("greeting: %v", err)
+	}
+	// The client-facing name is short; only the REWRITTEN token is oversized.
+	req := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len("big.example"))}, "big.example"...)
+	req = append(req, 0x00, 0x50) // port 80
+	c.Write(req)
+	head := make([]byte, 10)
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(c, head); err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	if head[1] == 0x00 {
+		t.Errorf("oversized token must not yield a success reply, got %v", head)
+	}
+	select {
+	case got := <-received:
+		t.Errorf("upstream must not receive a CONNECT, got %q", got)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 

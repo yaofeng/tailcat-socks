@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 const (
@@ -22,8 +26,6 @@ var (
 	socksFailReply = []byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 )
 
-var errUpstreamRefused = errors.New("upstream refused the CONNECT")
-
 // Server is the client-facing SOCKS5 front proxy. On each CONNECT it
 // rewrites the target host via DNSMap and forwards the request (as a SOCKS5
 // client) to the single `tailcat socks` upstream.
@@ -31,6 +33,9 @@ type Server struct {
 	DNSMap       *DNSMap
 	UpstreamAddr string
 	ln           net.Listener
+	// upstream dials the chained SOCKS5 connection to the tailcat socks
+	// upstream (built in NewServer from UpstreamAddr).
+	upstream proxy.Dialer
 	// relayIdle is how long the relay tolerates silence in either direction
 	// before tearing the session down.
 	relayIdle time.Duration
@@ -39,11 +44,15 @@ type Server struct {
 // NewServer binds the listen address. Use ActualAddr for the resolved port
 // (listening on port 0 is useful in tests).
 func NewServer(dnsMap *DNSMap, upstreamAddr, listen string) (*Server, error) {
+	dialer, err := proxy.SOCKS5("tcp", upstreamAddr, nil, proxy.Direct)
+	if err != nil {
+		return nil, fmt.Errorf("build upstream dialer for %q: %w", upstreamAddr, err)
+	}
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return nil, err
 	}
-	return &Server{DNSMap: dnsMap, UpstreamAddr: upstreamAddr, ln: ln, relayIdle: relayIdleTimeout}, nil
+	return &Server{DNSMap: dnsMap, UpstreamAddr: upstreamAddr, ln: ln, upstream: dialer, relayIdle: relayIdleTimeout}, nil
 }
 
 // ActualAddr returns the bound address once NewServer has succeeded.
@@ -129,18 +138,14 @@ func (s *Server) serveConn(client net.Conn) {
 	target := RewriteHost(host, s.DNSMap.Load())
 
 	// --- forward to upstream as a SOCKS5 client ---
-	up, err := net.DialTimeout("tcp", s.UpstreamAddr, upstreamDialTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamDialTimeout)
+	defer cancel()
+	up, err := s.dialUpstream(ctx, target, port)
 	if err != nil {
 		socksFail(client)
 		return
 	}
-	up.SetDeadline(time.Now().Add(upstreamDialTimeout)) // bound the handshake, like create_connection(timeout=15)
-	if err := upstreamConnect(up, target, port); err != nil {
-		up.Close()
-		socksFail(client)
-		return
-	}
-	up.SetDeadline(time.Time{}) // relay phase: shared idle timeout only
+	up.SetDeadline(time.Time{}) // relay phase: shared idle timeout only (x/net applies the ctx deadline only during its handshake)
 
 	client.Write(socksOKReply)
 	relay(client, up, s.relayIdle)
@@ -180,50 +185,15 @@ func readATYPAddr(r io.Reader, atyp byte) (string, error) {
 	return "", fmt.Errorf("unsupported ATYP %d", atyp)
 }
 
-// upstreamConnect performs the SOCKS5 client handshake with the upstream,
-// asking it to connect to host:port. Domains are sent as ATYP 0x03 so the
-// upstream resolves them (socks5h semantics); IPs use ATYP 0x01/0x04.
-func upstreamConnect(up net.Conn, host string, port uint16) error {
-	if _, err := up.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		return err
+// dialUpstream opens the chained SOCKS5 connection to the upstream, passing
+// host through as a domain (ATYP 0x03) when it is not an IP literal. The
+// x/net dialer bounds the whole dial+CONNECT exchange by ctx.
+func (s *Server) dialUpstream(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	d, ok := s.upstream.(proxy.ContextDialer)
+	if !ok {
+		return nil, errors.New("upstream dialer does not support DialContext")
 	}
-	var greet [2]byte
-	if _, err := io.ReadFull(up, greet[:]); err != nil {
-		return err
-	}
-	if greet[0] != 0x05 || greet[1] != 0x00 {
-		return errUpstreamRefused
-	}
-	var req []byte
-	if ip := net.ParseIP(host); ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			req = append([]byte{0x05, 0x01, 0x00, 0x01}, ip4...)
-		} else {
-			req = append([]byte{0x05, 0x01, 0x00, 0x04}, ip.To16()...)
-		}
-	} else {
-		req = append([]byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}, host...)
-	}
-	req = append(req, byte(port>>8), byte(port))
-	if _, err := up.Write(req); err != nil {
-		return err
-	}
-	var rep [4]byte
-	if _, err := io.ReadFull(up, rep[:]); err != nil {
-		return err
-	}
-	if rep[0] != 0x05 || rep[1] != 0x00 {
-		return errUpstreamRefused
-	}
-	// drain the bound address
-	if _, err := readATYPAddr(up, rep[3]); err != nil {
-		return err
-	}
-	var bnd [2]byte
-	if _, err := io.ReadFull(up, bnd[:]); err != nil {
-		return err
-	}
-	return nil
+	return d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
 }
 
 // relay copies data between client and upstream in both directions until
