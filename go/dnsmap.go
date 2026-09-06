@@ -32,18 +32,19 @@ func LoadDNSFile(path string) (map[string]string, error) {
 	return mapping, nil
 }
 
-// DNSMap holds the domain->token mapping, hot-swappable atomically.
+// DNSMap holds the current domain->token mapping, swapped atomically on
+// reload. The stored map must be treated as immutable after Store.
 type DNSMap struct {
-	v atomic.Value // map[string]string
+	v atomic.Pointer[map[string]string]
 }
 
 // Store atomically replaces the mapping.
-func (m *DNSMap) Store(mapping map[string]string) { m.v.Store(mapping) }
+func (m *DNSMap) Store(mapping map[string]string) { m.v.Store(&mapping) }
 
 // Load returns the current mapping (never nil).
 func (m *DNSMap) Load() map[string]string {
-	if v := m.v.Load(); v != nil {
-		return v.(map[string]string)
+	if p := m.v.Load(); p != nil {
+		return *p
 	}
 	return map[string]string{}
 }
