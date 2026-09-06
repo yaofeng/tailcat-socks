@@ -39,7 +39,12 @@ type DNSMap struct {
 }
 
 // Store atomically replaces the mapping.
-func (m *DNSMap) Store(mapping map[string]string) { m.v.Store(&mapping) }
+func (m *DNSMap) Store(mapping map[string]string) {
+	if mapping == nil {
+		mapping = map[string]string{}
+	}
+	m.v.Store(&mapping)
+}
 
 // Load returns the current mapping (never nil).
 func (m *DNSMap) Load() map[string]string {
