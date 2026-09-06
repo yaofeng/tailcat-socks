@@ -48,16 +48,18 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 
 	// Validate --listen: SplitHostPort for the host:port shape plus a numeric
 	// in-range port, so junk like "host:abc" is reported here instead of by
-	// net.Listen later. An empty host (":8080") binds every interface.
+	// net.Listen later. An empty host (":8080") binds every interface. The
+	// "(want host:port)" hint belongs to the shape error only, not the port.
 	lHost, lPort, err := net.SplitHostPort(listen)
-	if err == nil {
-		var p int
-		if p, err = strconv.Atoi(lPort); err == nil && (p < 0 || p > 65535) {
-			err = fmt.Errorf("port %d out of range", p)
-		}
-	}
 	if err != nil {
 		slog.Error("bad --listen", "value", listen, "err", fmt.Errorf("%q: %w (want host:port)", listen, err))
+		return 1
+	}
+	if p, perr := strconv.Atoi(lPort); perr != nil {
+		slog.Error("bad --listen", "value", listen, "err", fmt.Errorf("%q: %w", listen, perr))
+		return 1
+	} else if p < 0 || p > 65535 {
+		slog.Error("bad --listen", "value", listen, "err", fmt.Errorf("%q: port %d out of range", listen, p))
 		return 1
 	}
 	listen = net.JoinHostPort(lHost, lPort)

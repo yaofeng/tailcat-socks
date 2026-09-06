@@ -122,7 +122,12 @@ func TestSpawnTailcatSocksAndWaitReady(t *testing.T) {
 // TestSpawnTailcatSocksIPv6 pins the regression where the child received an
 // unbracketed IPv6 --listen (e.g. ::1:1234) and never bound the port.
 func TestSpawnTailcatSocksIPv6(t *testing.T) {
-	addr := net.JoinHostPort("::1", strconv.Itoa(freePort(t, "::1")))
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback on this host: %v", err)
+	}
+	addr := ln.Addr().String() // "[::1]:port", brackets included
+	ln.Close()
 	child := spawnTailcatSocks(fakeTailcatBin, addr)
 	if child == nil {
 		t.Fatal("spawn failed")
