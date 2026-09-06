@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -33,10 +34,11 @@ func main() {
 }
 
 func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch bool) int {
-	// Install the signal handler before doing anything else, so SIGINT/SIGTERM
-	// arriving during launch cannot orphan the tailcat child.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	// Install the signal handler before doing anything else: the child's life
+	// is bound to ctx, so SIGINT/SIGTERM arriving during launch must already
+	// cancel it — otherwise the tailcat child would be orphaned.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	first, err := LoadDNSFile(dnsFile)
 	if err != nil {
@@ -78,17 +80,34 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 		return 1
 	}
 
-	var child *exec.Cmd
+	var (
+		child     *exec.Cmd
+		childErr  error
+		childDone chan struct{} // closed by the monitor goroutine once Wait returns
+	)
 	if !noAutolaunch {
-		child = spawnTailcatSocks(tailcatBin, upAddr)
-		if child == nil {
+		child, err = spawnTailcatSocks(ctx, tailcatBin, upAddr)
+		if err != nil {
+			slog.Error("failed to launch tailcat socks", "bin", tailcatBin, "err", err)
 			srv.Close()
 			return 1
 		}
+		// Reap the child in the background — cmd.Wait must always run, both
+		// to release its resources and to let exec's Cancel/WaitDelay
+		// escalation complete. Writing childErr before closing childDone is
+		// the happens-before edge that makes reading childErr race-free.
+		childDone = make(chan struct{})
+		go func() {
+			childErr = child.Wait()
+			close(childDone)
+		}()
 		if !waitReady(upAddr, 15*time.Second) {
 			slog.Error("upstream not ready; aborting", "addr", upAddr)
-			terminate(child)
+			stop() // cancels ctx: SIGTERM to the child, SIGKILL after childKillGrace
 			srv.Close()
+			if child != nil {
+				<-childDone
+			}
 			return 1
 		}
 		slog.Info("auto-launched tailcat socks", "bin", tailcatBin, "addr", upAddr)
@@ -108,17 +127,31 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	slog.Info("using upstream", "addr", upAddr)
 
 	select {
-	case <-sig:
+	case <-ctx.Done():
 	case err := <-serveErr:
 		// srv.Close() during shutdown makes Serve() report net.ErrClosed;
 		// that is not a real failure, so keep signal exits quiet.
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			slog.Error("server error", "err", err)
 		}
+	case <-childDone:
+		// The tailcat child died on its own; without an upstream we are
+		// useless, so surface why and exit nonzero. (childDone is nil in
+		// --no-autolaunch mode, which a select never readies on.)
+		if childErr != nil {
+			slog.Error("tailcat socks exited", "err", childErr)
+		} else {
+			slog.Error("tailcat socks exited unexpectedly")
+		}
+		srv.Close()
+		return 1
 	}
+	stop() // cancels ctx: SIGTERM to the child (then SIGKILL), harmless without one
 	close(stopWatch)
 	srv.Close()
-	terminate(child)
+	if child != nil {
+		<-childDone // reap the child before exiting so it cannot outlive us
+	}
 	return 0
 }
 
@@ -150,37 +183,25 @@ func upstreamAddr(s string) (string, error) {
 	return ln.Addr().String(), nil
 }
 
-// spawnTailcatSocks launches `tailcat socks --listen=addr` and returns the
-// cmd, or nil on failure. addr is passed verbatim, so IPv6 keeps its brackets.
-// Child output goes to our stderr so it lands in the same log file.
-func spawnTailcatSocks(binPath, addr string) *exec.Cmd {
-	cmd := exec.Command(binPath, "socks", "--listen="+addr)
+// childKillGrace is how long a canceled spawn waits for the child to honor
+// SIGTERM before exec escalates to SIGKILL.
+const childKillGrace = 5 * time.Second
+
+// spawnTailcatSocks launches `tailcat socks --listen=addr` bound to ctx: when
+// ctx is canceled the child gets SIGTERM, escalating to SIGKILL after
+// childKillGrace (both handled by exec.CommandContext; the caller must still
+// call cmd.Wait to reap it). addr is passed verbatim, so IPv6 keeps its
+// brackets. Child output goes to our stderr so it lands in the same log file.
+func spawnTailcatSocks(ctx context.Context, binPath, addr string) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, binPath, "socks", "--listen="+addr)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = childKillGrace
 	if err := cmd.Start(); err != nil {
-		slog.Error("failed to launch tailcat socks", "bin", binPath, "err", err)
-		return nil
+		return nil, fmt.Errorf("launch %s: %w", binPath, err)
 	}
-	return cmd
-}
-
-// terminate stops the child: SIGTERM, then SIGKILL after 5s.
-func terminate(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil || cmd.ProcessState != nil {
-		return
-	}
-	cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck — best effort
-	done := make(chan struct{})
-	go func() {
-		cmd.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		cmd.Process.Kill() //nolint:errcheck — best effort
-		<-done
-	}
+	return cmd, nil
 }
 
 // waitReady polls TCP-connect to addr until it accepts or the timeout hits.

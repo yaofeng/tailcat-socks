@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -107,13 +110,72 @@ func freePort(t *testing.T, host string) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
+// spawnTestChild launches fakeTailcatBin on addr bound to a fresh cancellable
+// context and starts its cmd.Wait reap in a goroutine (the child is only
+// reaped while Wait runs). It returns the cmd, a channel closed once the child
+// is reaped, and the context's cancel func. Cleanup cancels the context
+// (SIGTERM now, SIGKILL after childKillGrace) and waits for the reap, so
+// tests never leak children or zombies.
+func spawnTestChild(t *testing.T, addr string) (cmd *exec.Cmd, reaped <-chan struct{}, cancel context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd, err := spawnTailcatSocks(ctx, fakeTailcatBin, addr)
+	if err != nil {
+		cancel()
+		t.Fatalf("spawnTailcatSocks(%q, %q): %v", fakeTailcatBin, addr, err)
+	}
+	done := make(chan struct{})
+	go func() {
+		// A child stopped via ctx cancellation exits on a signal (an
+		// *exec.ExitError) or, if the WaitDelay path fired, with
+		// context.Canceled; anything else is a real failure.
+		if err := cmd.Wait(); err != nil {
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) && !errors.Is(err, context.Canceled) {
+				t.Errorf("cmd.Wait: unexpected error: %v", err)
+			}
+		}
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(childKillGrace + 3*time.Second):
+			t.Errorf("child not reaped within %v of ctx cancel", childKillGrace+3*time.Second)
+		}
+	})
+	return cmd, done, cancel
+}
+
+func TestSpawnTailcatSocks(t *testing.T) {
+	// Success: non-nil cmd, nil error, and the child listens on addr.
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t, "127.0.0.1")))
+	cmd, _, _ := spawnTestChild(t, addr)
+	if cmd == nil {
+		t.Fatal("spawnTailcatSocks returned nil cmd with nil error")
+	}
+	if !waitReady(addr, 5*time.Second) {
+		t.Fatalf("fake tailcat never became ready on %s", addr)
+	}
+
+	// Failure: a bad binPath returns a wrapped error naming the path —
+	// never a nil cmd with nil error, never os.Exit.
+	if badCmd, err := spawnTailcatSocks(context.Background(), "/nonexistent/tailcat", addr); err == nil {
+		t.Errorf("spawnTailcatSocks with bad binPath: want error, got nil (cmd %v)", badCmd)
+	} else if badCmd != nil {
+		t.Error("spawnTailcatSocks with bad binPath: want nil cmd, got non-nil")
+	} else if !strings.Contains(err.Error(), "/nonexistent/tailcat") {
+		t.Errorf("error %v does not mention the bin path", err)
+	}
+}
+
 func TestSpawnTailcatSocksAndWaitReady(t *testing.T) {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t, "127.0.0.1")))
-	child := spawnTailcatSocks(fakeTailcatBin, addr)
-	if child == nil {
+	cmd, _, _ := spawnTestChild(t, addr)
+	if cmd == nil {
 		t.Fatal("spawn failed")
 	}
-	t.Cleanup(func() { terminate(child) })
 	if !waitReady(addr, 5*time.Second) {
 		t.Fatal("fake tailcat never became ready")
 	}
@@ -128,32 +190,36 @@ func TestSpawnTailcatSocksIPv6(t *testing.T) {
 	}
 	addr := ln.Addr().String() // "[::1]:port", brackets included
 	ln.Close()
-	child := spawnTailcatSocks(fakeTailcatBin, addr)
-	if child == nil {
+	cmd, _, _ := spawnTestChild(t, addr)
+	if cmd == nil {
 		t.Fatal("spawn failed")
 	}
-	t.Cleanup(func() { terminate(child) })
 	if !waitReady(addr, 5*time.Second) {
 		t.Fatalf("fake tailcat never became ready on %s", addr)
 	}
 }
 
-func TestTerminateStopsChild(t *testing.T) {
+// TestSpawnedChildDiesWithContext pins the Cancel→SIGTERM→WaitDelay→SIGKILL
+// escalation: canceling the spawn context must reap the child within
+// childKillGrace (fake-tailcat honors SIGTERM immediately, so this measures
+// the SIGTERM leg; the bound also proves the escalation can never hang).
+func TestSpawnedChildDiesWithContext(t *testing.T) {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t, "127.0.0.1")))
-	child := spawnTailcatSocks(fakeTailcatBin, addr)
-	if child == nil {
-		t.Fatal("spawn failed")
+	cmd, reaped, cancel := spawnTestChild(t, addr)
+	if !waitReady(addr, 5*time.Second) {
+		t.Fatal("fake tailcat never became ready")
 	}
-	terminate(child)
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && child.ProcessState == nil {
-		time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	cancel()
+	select {
+	case <-reaped:
+		if d := time.Since(start); d > childKillGrace+3*time.Second {
+			t.Errorf("child took %v to die after ctx cancel, want <= %v", d, childKillGrace+3*time.Second)
+		}
+	case <-time.After(childKillGrace + 3*time.Second):
+		t.Fatal("child still alive after ctx cancel + grace")
 	}
-	if child.ProcessState == nil {
-		t.Fatal("child did not exit after terminate")
+	if cmd.ProcessState == nil {
+		t.Error("child reaped but cmd.ProcessState is nil")
 	}
-}
-
-func TestTerminateNilIsSafe(t *testing.T) {
-	terminate(nil)
 }
