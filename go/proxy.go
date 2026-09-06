@@ -7,7 +7,7 @@ import (
 	"io"
 	"net"
 	"strconv"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
@@ -139,8 +139,7 @@ func (s *Server) serveConn(client net.Conn) {
 	up.SetDeadline(time.Time{}) // relay phase: shared idle timeout only (dialUpstream hands back a deadline-free conn)
 
 	client.Write(socksOKReply)
-	relay(client, up, s.relayIdle)
-	up.Close()
+	relay(client, up, s.relayIdle) // relay owns both conns and closes them
 }
 
 // readATYPAddr reads a SOCKS5 address of the given ATYP and returns it as a
@@ -227,7 +226,7 @@ func socksConnectRequest(host string, port uint16) ([]byte, error) {
 // socksClientConnect performs the greeting + CONNECT exchange on an already
 // dialed upstream conn using the pre-encoded request. The conn's deadline is
 // set from ctx for the handshake and cleared on success, so the relay phase
-// is governed by the shared idle clock alone. net.Conn.Write is
+// is governed by the shared idle timer alone. net.Conn.Write is
 // full-write-or-error by its io.Writer contract, so the err checks below are
 // also the short-write checks.
 func socksClientConnect(ctx context.Context, conn net.Conn, req []byte) error {
@@ -268,31 +267,76 @@ func socksClientConnect(ctx context.Context, conn net.Conn, req []byte) error {
 }
 
 // relay copies data between client and upstream in both directions until
-// either side closes or the idle timeout fires. Like the Python version's
-// select() loop, the idle clock is SHARED: traffic in either direction
-// resets the window for both, so a healthy one-way transfer (e.g. a long
-// download with no client upload) is never killed as idle.
+// either side closes. One shared idle timer covers both directions: any read
+// of real bytes re-arms it, so a healthy one-way transfer (e.g. a long
+// download with no client upload) is never killed as idle. When the timer
+// fires, or both directions have ended, the connection is torn down with
+// half-closes (FIN first) so the peers see clean EOF instead of RST.
 func relay(client, upstream net.Conn, idle time.Duration) {
-	var clock atomic.Int64
-	clock.Store(time.Now().UnixNano())
-	done := make(chan struct{}, 2)
-	go func() { copyWithIdleTimeout(upstream, client, idle, &clock); done <- struct{}{} }()
-	go func() { copyWithIdleTimeout(client, upstream, idle, &clock); done <- struct{}{} }()
-	<-done
-	// One direction finished (EOF, error or idle timeout). The peer's socket
-	// may still hold unread bytes in our kernel receive queue; a plain Close
-	// there makes Linux send RST instead of FIN (tcp_close: data_was_unread),
-	// which destroys data the other side has not read yet. Python's _relay
-	// instead does shutdown(SHUT_RDWR) on both sockets, which emits FIN (and
-	// drops queued bytes without RST), and only then closes. Mirror that:
-	// half-close both ends and only then close the descriptors. The Close
-	// stays before the final reap so a copy direction stuck writing to a
-	// stalled peer is still unblocked, exactly as before the fix.
-	halfClose(client)
-	halfClose(upstream)
-	client.Close()
-	upstream.Close()
-	<-done
+	var once sync.Once
+	// stop closes the RAW conns: halfClose's *net.TCPConn assertion must not
+	// see the idleConn wrappers below.
+	stop := func() {
+		// The peer's socket may still hold unread bytes in our kernel receive
+		// queue; a plain Close there makes Linux send RST instead of FIN
+		// (tcp_close: data_was_unread), which destroys data the other side
+		// has not read yet. Python's _relay instead does shutdown(SHUT_RDWR)
+		// on both sockets, which emits FIN (and drops queued bytes without
+		// RST), and only then closes. Mirror that: half-close both ends and
+		// only then close the descriptors. The Close stays after the
+		// half-closes so a copy direction stuck writing to a stalled peer is
+		// still unblocked.
+		halfClose(client)
+		halfClose(upstream)
+		client.Close()
+		upstream.Close()
+	}
+	idleTimer := time.AfterFunc(idle, func() { once.Do(stop) })
+	defer idleTimer.Stop()
+	wake := func() { idleTimer.Reset(idle) }
+	wrappedClient := &idleConn{Conn: client, onActivity: wake}
+	wrappedUpstream := &idleConn{Conn: upstream, onActivity: wake}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, err := io.Copy(wrappedUpstream, wrappedClient); err == nil {
+			closeWrite(wrappedUpstream)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if _, err := io.Copy(wrappedClient, wrappedUpstream); err == nil {
+			closeWrite(wrappedClient)
+		}
+	}()
+	wg.Wait()
+	once.Do(stop)
+}
+
+// idleConn counts real bytes as activity, re-arming the shared idle timer.
+type idleConn struct {
+	net.Conn
+	onActivity func()
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.onActivity()
+	}
+	return n, err
+}
+
+// closeWrite sends FIN on the TCP connection, whether wrapped or raw.
+func closeWrite(conn net.Conn) {
+	if c, ok := conn.(*idleConn); ok {
+		conn = c.Conn
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.CloseWrite()
+	}
 }
 
 // halfClose is the Go equivalent of shutdown(fd, SHUT_RDWR). The anti-RST
@@ -311,33 +355,4 @@ func halfClose(conn net.Conn) {
 	}
 	tc.CloseWrite() // FIN to the peer, like shutdown(SHUT_WR)
 	tc.CloseRead()  // stop caring about further input, like shutdown(SHUT_RD)
-}
-
-// copyWithIdleTimeout copies src to dst, giving up if no data arrives from
-// anywhere (either direction) within idle. The deadline is derived from the
-// shared activity clock (last activity + idle), reproducing the Python
-// relay's single select() window; writes stay deadline-free like in Python.
-// A blocked Read cannot observe clock updates, so on a timeout we re-arm and
-// keep waiting whenever another direction has moved the clock past the
-// deadline that just fired — only true idleness returns.
-func copyWithIdleTimeout(dst, src net.Conn, idle time.Duration, clock *atomic.Int64) error {
-	buf := make([]byte, 65536)
-	for {
-		deadline := time.Unix(0, clock.Load()).Add(idle)
-		src.SetReadDeadline(deadline)
-		n, rerr := src.Read(buf)
-		if n > 0 {
-			clock.Store(time.Now().UnixNano())
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return werr
-			}
-		}
-		if rerr != nil {
-			if ne, ok := rerr.(net.Error); ok && ne.Timeout() &&
-				time.Unix(0, clock.Load()).Add(idle).After(deadline) {
-				continue // activity elsewhere extended the window; keep waiting
-			}
-			return rerr
-		}
-	}
 }

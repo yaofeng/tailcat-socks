@@ -127,7 +127,7 @@ func startProxy(t *testing.T, mapping map[string]string, upstream string) *Serve
 }
 
 // startProxyWithIdle is startProxy with a short relay idle timeout, for
-// exercising the shared idle clock without waiting 300s.
+// exercising the shared idle timer without waiting 300s.
 func startProxyWithIdle(t *testing.T, mapping map[string]string, upstream string, idle time.Duration) *Server {
 	t.Helper()
 	srv := newProxy(t, mapping, upstream)
@@ -338,11 +338,11 @@ func silentUpstream(t *testing.T, got *atomic.Int64) string {
 	return ln.Addr().String()
 }
 
-// TestRelayIdleClockIsSharedAcrossDirections pins Python's select() behavior:
-// one shared 300s clock reset by traffic in EITHER direction. A one-way
+// TestRelayIdleWindowSharedAcrossDirections pins Python's select() behavior:
+// one shared 300s window that traffic in EITHER direction re-arms. A one-way
 // transfer (here: client pumps, upstream never answers) must not be killed by
 // the idle timeout just because one side is silent.
-func TestRelayIdleClockIsSharedAcrossDirections(t *testing.T) {
+func TestRelayIdleWindowSharedAcrossDirections(t *testing.T) {
 	var got atomic.Int64
 	up := silentUpstream(t, &got)
 	// 200ms idle; the pump below runs 1.2s (6x idle) in one direction only.
@@ -467,6 +467,109 @@ func TestRelayEarlyClosingUpstreamDeliversDataAndCleanEOF(t *testing.T) {
 	}
 	if len(failures) > 0 {
 		t.Fatalf("%d/%d iterations failed:\n%s", len(failures), iterations, strings.Join(failures, "\n"))
+	}
+}
+
+// eofThenReplyUpstream completes the SOCKS5 handshake, reads until it sees
+// EOF, reports the payload byte count it received on eofSeen, then writes
+// reply and closes. It never reads again after EOF — the reply is only
+// possible if the relay forwarded the client's FIN as a half-close instead of
+// tearing the upstream leg down.
+func eofThenReplyUpstream(t *testing.T, reply []byte, eofSeen chan<- int) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		hdr := make([]byte, 2)
+		io.ReadFull(conn, hdr)
+		io.ReadFull(conn, make([]byte, hdr[1]))
+		conn.Write([]byte{0x05, 0x00})
+		req := make([]byte, 4)
+		io.ReadFull(conn, req)
+		switch req[3] {
+		case 0x03:
+			l := make([]byte, 1)
+			io.ReadFull(conn, l)
+			io.ReadFull(conn, make([]byte, l[0]))
+		case 0x01:
+			io.ReadFull(conn, make([]byte, 4))
+		case 0x04:
+			io.ReadFull(conn, make([]byte, 16))
+		}
+		io.ReadFull(conn, make([]byte, 2))
+		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		buf := make([]byte, 4096)
+		total := 0
+		for {
+			n, err := conn.Read(buf)
+			total += n
+			if err != nil {
+				eofSeen <- total
+				break
+			}
+		}
+		conn.Write(reply)
+	}()
+	return ln.Addr().String()
+}
+
+// TestRelayClientEOFPropagatesToUpstream pins the forward leg of the
+// half-close: when the client half-closes (FIN, its read side still open),
+// the upstream must see EOF on its read side yet still be able to send data
+// back and have it delivered. Tearing the session down as soon as one
+// direction ends destroys that reply (the old relay half-closed both sockets
+// the moment either copy returned).
+func TestRelayClientEOFPropagatesToUpstream(t *testing.T) {
+	eofSeen := make(chan int, 1)
+	up := eofThenReplyUpstream(t, []byte("ANSWER"), eofSeen)
+	srv := startProxy(t, map[string]string{}, up)
+
+	c := socksConnect(t, srv.ActualAddr().String(), "plain.example", 80)
+	defer c.Close()
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("client conn is %T, want *net.TCPConn (CloseWrite needed)", c)
+	}
+	c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Write([]byte("HELLO")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := tc.CloseWrite(); err != nil { // FIN upstream, read side stays open
+		t.Fatalf("CloseWrite: %v", err)
+	}
+
+	var got int
+	select {
+	case got = <-eofSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream never saw EOF: client FIN was not propagated")
+	}
+	if got < len("HELLO") {
+		t.Errorf("upstream saw %d payload bytes before EOF, want >= %d", got, len("HELLO"))
+	}
+
+	// The reverse direction must still work after the forward half-close.
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, len("ANSWER"))
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatalf("reply after half-close not delivered: %v", err)
+	}
+	if string(buf) != "ANSWER" {
+		t.Errorf("reply = %q, want ANSWER", buf)
+	}
+	// The upstream closed after the reply; the relay must follow with a
+	// clean FIN, not an RST.
+	one := make([]byte, 1)
+	if _, err := c.Read(one); err != io.EOF {
+		t.Errorf("after reply: read err = %v, want clean EOF", err)
 	}
 }
 
