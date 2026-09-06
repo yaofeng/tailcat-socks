@@ -97,6 +97,14 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	if !noAutolaunch {
 		child, err = spawnTailcatSocks(ctx, tailcatBin, upAddr)
 		if err != nil {
+			// A signal landing before the spawn shows up here as a start
+			// failure (exec refuses to fork with an already-canceled ctx, so
+			// there is no child to reap): that is a quiet signal exit, not a
+			// launch failure.
+			if ctx.Err() != nil {
+				srv.Close()
+				return 0
+			}
 			slog.Error("failed to launch tailcat socks", "bin", tailcatBin, "err", err)
 			srv.Close()
 			return 1
@@ -155,20 +163,25 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	default:
 	}
 
-	select {
-	case <-ctx.Done():
-	case err := <-serveErr:
-		// srv.Close() during shutdown makes Serve() report net.ErrClosed;
-		// that is not a real failure, so keep signal exits quiet.
-		if err != nil && !errors.Is(err, net.ErrClosed) {
-			slog.Error("server error", "err", err)
+	// Only wait for events if the pre-check did not already attribute the
+	// shutdown: with a dead child the select's childDone case is the only
+	// ready one, and running it would log the child's exit twice.
+	if code == 0 {
+		select {
+		case <-ctx.Done():
+		case err := <-serveErr:
+			// srv.Close() during shutdown makes Serve() report net.ErrClosed;
+			// that is not a real failure, so keep signal exits quiet.
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				slog.Error("server error", "err", err)
+			}
+		case <-childDone:
+			// The tailcat child died on its own; without an upstream we are
+			// useless, so surface why and exit nonzero. (childDone is nil in
+			// --no-autolaunch mode, which a select never readies on.)
+			logChildExit(child, childErr)
+			code = 1
 		}
-	case <-childDone:
-		// The tailcat child died on its own; without an upstream we are
-		// useless, so surface why and exit nonzero. (childDone is nil in
-		// --no-autolaunch mode, which a select never readies on.)
-		logChildExit(child, childErr)
-		code = 1
 	}
 	cancel() // stops the child if alive: SIGTERM, then SIGKILL; harmless without one
 	close(stopWatch)
