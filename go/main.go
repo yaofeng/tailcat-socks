@@ -23,7 +23,7 @@ func main() {
 	var (
 		listen       = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address (host:port; empty host binds all interfaces)")
 		dnsFile      = flag.String("dns-file", "dns.txt", "domain->token mapping file")
-		upstream     = flag.String("upstream", "127.0.0.1:0", "upstream tailcat socks address (host:port; port 0 = OS-assigned free port)")
+		upstream     = flag.String("upstream", "127.0.0.1:0", "upstream tailcat socks address (host:port; empty host binds all interfaces; port 0 = OS-assigned free port)")
 		tailcatBin   = flag.String("tailcat-bin", "tailcat", "path to tailcat binary (auto-launched)")
 		noAutolaunch = flag.Bool("no-autolaunch", false, "do not spawn tailcat socks; use an already-running upstream")
 		noWatch      = flag.Bool("no-watch", false, "disable dns.txt hot-reload")
@@ -46,12 +46,18 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	dnsMap := &DNSMap{}
 	dnsMap.Store(first)
 
-	// Validate --listen as a proper host:port. An empty host (":8080") binds
-	// every interface; bracketed IPv6 comes out well-formed for net.Listen.
+	// Validate --listen: SplitHostPort for the host:port shape plus a numeric
+	// in-range port, so junk like "host:abc" is reported here instead of by
+	// net.Listen later. An empty host (":8080") binds every interface.
 	lHost, lPort, err := net.SplitHostPort(listen)
+	if err == nil {
+		var p int
+		if p, err = strconv.Atoi(lPort); err == nil && (p < 0 || p > 65535) {
+			err = fmt.Errorf("port %d out of range", p)
+		}
+	}
 	if err != nil {
-		err = fmt.Errorf("bad --listen %q: %w (want host:port)", listen, err)
-		slog.Error("bad --listen", "err", err)
+		slog.Error("bad --listen", "value", listen, "err", fmt.Errorf("%q: %w (want host:port)", listen, err))
 		return 1
 	}
 	listen = net.JoinHostPort(lHost, lPort)
@@ -60,13 +66,9 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	// gets an OS-assigned free port.
 	upAddr, err := upstreamAddr(upstream)
 	if err != nil {
-		slog.Error("bad --upstream", "err", err)
+		slog.Error("bad --upstream", "value", upstream, "err", err)
 		return 1
 	}
-	// upstreamAddr always returns a well-formed host:port, so these splits
-	// cannot fail; we only need the parts back for the child's --listen flag.
-	upHost, upPortStr, _ := net.SplitHostPort(upAddr)
-	upPort, _ := strconv.Atoi(upPortStr)
 
 	srv, err := NewServer(dnsMap, upAddr, listen)
 	if err != nil {
@@ -76,7 +78,7 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 
 	var child *exec.Cmd
 	if !noAutolaunch {
-		child = spawnTailcatSocks(tailcatBin, upHost, upPort)
+		child = spawnTailcatSocks(tailcatBin, upAddr)
 		if child == nil {
 			srv.Close()
 			return 1
@@ -120,16 +122,20 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 
 // upstreamAddr validates the --upstream flag value and returns the address to
 // dial. A port of 0 asks the OS for a free port and returns the concrete
-// address that was probed (there is an unavoidable race between probe and
-// dial, accepted because the window is tiny and failure is reported normally).
+// address that was probed (there is an unavoidable race between closing the
+// probe listener and the child binding that port, accepted because the window
+// is tiny and failure is reported normally).
 func upstreamAddr(s string) (string, error) {
 	host, portStr, err := net.SplitHostPort(s)
 	if err != nil {
-		return "", fmt.Errorf("bad --upstream %q: %w (want host:port)", s, err)
+		return "", fmt.Errorf("%q: %w (want host:port)", s, err)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return "", fmt.Errorf("bad --upstream %q: %w", s, err)
+		return "", fmt.Errorf("%q: %w", s, err)
+	}
+	if port < 0 || port > 65535 {
+		return "", fmt.Errorf("%q: port %d out of range", s, port)
 	}
 	if port != 0 {
 		return net.JoinHostPort(host, strconv.Itoa(port)), nil
@@ -142,11 +148,11 @@ func upstreamAddr(s string) (string, error) {
 	return ln.Addr().String(), nil
 }
 
-// spawnTailcatSocks launches `tailcat socks --listen=host:port` and returns
-// the cmd, or nil on failure. Child output goes to our stderr so it lands in
-// the same log file.
-func spawnTailcatSocks(binPath, host string, port int) *exec.Cmd {
-	cmd := exec.Command(binPath, "socks", fmt.Sprintf("--listen=%s:%d", host, port))
+// spawnTailcatSocks launches `tailcat socks --listen=addr` and returns the
+// cmd, or nil on failure. addr is passed verbatim, so IPv6 keeps its brackets.
+// Child output goes to our stderr so it lands in the same log file.
+func spawnTailcatSocks(binPath, addr string) *exec.Cmd {
+	cmd := exec.Command(binPath, "socks", "--listen="+addr)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

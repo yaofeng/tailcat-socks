@@ -62,40 +62,80 @@ func TestUpstreamAddr(t *testing.T) {
 		t.Errorf("port %d out of range 1..65535", port)
 	}
 
+	// Bracketed IPv6 keeps its brackets (JoinHostPort restores them).
+	got, err = upstreamAddr("[::1]:1080")
+	if err != nil {
+		t.Fatalf(`upstreamAddr("[::1]:1080"): %v`, err)
+	}
+	if got != "[::1]:1080" {
+		t.Errorf(`upstreamAddr("[::1]:1080") = %q, want "[::1]:1080"`, got)
+	}
+
+	// Empty host with port 0 still yields a concrete, parseable address.
+	got, err = upstreamAddr(":0")
+	if err != nil {
+		t.Fatalf(`upstreamAddr(":0"): %v`, err)
+	}
+	_, portStr, err = net.SplitHostPort(got)
+	if err != nil {
+		t.Fatalf(`upstreamAddr(":0") = %q: SplitHostPort: %v`, got, err)
+	}
+	port, err = strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf(`upstreamAddr(":0") = %q: port %q is not numeric: %v`, got, portStr, err)
+	}
+	if port < 1 || port > 65535 {
+		t.Errorf(`upstreamAddr(":0") = %q: port %d out of range 1..65535`, got, port)
+	}
+
 	// Malformed inputs are rejected.
-	for _, bad := range []string{"127.0.0.1", ":0x22", "[::1]", "::1", "host:abc"} {
+	for _, bad := range []string{"127.0.0.1", ":0x22", "[::1]", "::1", "host:abc", "127.0.0.1:99999", "127.0.0.1:-1"} {
 		if _, err := upstreamAddr(bad); err == nil {
 			t.Errorf("upstreamAddr(%q): want error, got nil", bad)
 		}
 	}
 }
 
-// freePort asks the OS for a free loopback port by briefly binding :0.
-func freePort(t *testing.T) int {
+// freePort asks the OS for a free port on host by briefly binding host:0.
+func freePort(t *testing.T, host string) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
 	if err != nil {
-		t.Fatalf("reserve free port: %v", err)
+		t.Fatalf("reserve free port on %s: %v", host, err)
 	}
 	defer ln.Close()
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
 func TestSpawnTailcatSocksAndWaitReady(t *testing.T) {
-	port := freePort(t)
-	child := spawnTailcatSocks(fakeTailcatBin, "127.0.0.1", port)
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t, "127.0.0.1")))
+	child := spawnTailcatSocks(fakeTailcatBin, addr)
 	if child == nil {
 		t.Fatal("spawn failed")
 	}
 	t.Cleanup(func() { terminate(child) })
-	if !waitReady(fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second) {
+	if !waitReady(addr, 5*time.Second) {
 		t.Fatal("fake tailcat never became ready")
 	}
 }
 
+// TestSpawnTailcatSocksIPv6 pins the regression where the child received an
+// unbracketed IPv6 --listen (e.g. ::1:1234) and never bound the port.
+func TestSpawnTailcatSocksIPv6(t *testing.T) {
+	addr := net.JoinHostPort("::1", strconv.Itoa(freePort(t, "::1")))
+	child := spawnTailcatSocks(fakeTailcatBin, addr)
+	if child == nil {
+		t.Fatal("spawn failed")
+	}
+	t.Cleanup(func() { terminate(child) })
+	if !waitReady(addr, 5*time.Second) {
+		t.Fatalf("fake tailcat never became ready on %s", addr)
+	}
+}
+
 func TestTerminateStopsChild(t *testing.T) {
-	port := freePort(t)
-	child := spawnTailcatSocks(fakeTailcatBin, "127.0.0.1", port)
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t, "127.0.0.1")))
+	child := spawnTailcatSocks(fakeTailcatBin, addr)
 	if child == nil {
 		t.Fatal("spawn failed")
 	}
