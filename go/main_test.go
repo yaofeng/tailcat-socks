@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -155,7 +156,7 @@ func TestSpawnTailcatSocks(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("spawnTailcatSocks returned nil cmd with nil error")
 	}
-	if !waitReady(addr, 5*time.Second) {
+	if !waitReady(context.Background(), addr, 5*time.Second) {
 		t.Fatalf("fake tailcat never became ready on %s", addr)
 	}
 
@@ -176,7 +177,7 @@ func TestSpawnTailcatSocksAndWaitReady(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("spawn failed")
 	}
-	if !waitReady(addr, 5*time.Second) {
+	if !waitReady(context.Background(), addr, 5*time.Second) {
 		t.Fatal("fake tailcat never became ready")
 	}
 }
@@ -194,19 +195,19 @@ func TestSpawnTailcatSocksIPv6(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("spawn failed")
 	}
-	if !waitReady(addr, 5*time.Second) {
+	if !waitReady(context.Background(), addr, 5*time.Second) {
 		t.Fatalf("fake tailcat never became ready on %s", addr)
 	}
 }
 
-// TestSpawnedChildDiesWithContext pins the Cancel→SIGTERM→WaitDelay→SIGKILL
-// escalation: canceling the spawn context must reap the child within
-// childKillGrace (fake-tailcat honors SIGTERM immediately, so this measures
-// the SIGTERM leg; the bound also proves the escalation can never hang).
+// TestSpawnedChildDiesWithContext pins the SIGTERM leg of the
+// Cancel→SIGTERM→WaitDelay→SIGKILL ladder: canceling the spawn context must
+// reap the (SIGTERM-honoring) child well within childKillGrace, proving the
+// escalation can never hang.
 func TestSpawnedChildDiesWithContext(t *testing.T) {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t, "127.0.0.1")))
 	cmd, reaped, cancel := spawnTestChild(t, addr)
-	if !waitReady(addr, 5*time.Second) {
+	if !waitReady(context.Background(), addr, 5*time.Second) {
 		t.Fatal("fake tailcat never became ready")
 	}
 	start := time.Now()
@@ -221,5 +222,39 @@ func TestSpawnedChildDiesWithContext(t *testing.T) {
 	}
 	if cmd.ProcessState == nil {
 		t.Error("child reaped but cmd.ProcessState is nil")
+	}
+}
+
+// TestSpawnedChildDiesWithSIGKILL pins the SIGKILL leg: a child that ignores
+// SIGTERM (FAKE_TAILCAT_IGNORE_TERM, inherited via the environment) must
+// still die — WaitDelay fires Kill at childKillGrace — and the reap must
+// show death by SIGKILL.
+func TestSpawnedChildDiesWithSIGKILL(t *testing.T) {
+	t.Setenv("FAKE_TAILCAT_IGNORE_TERM", "1")
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t, "127.0.0.1")))
+	cmd, reaped, cancel := spawnTestChild(t, addr)
+	if !waitReady(context.Background(), addr, 5*time.Second) {
+		t.Fatal("fake tailcat never became ready")
+	}
+	start := time.Now()
+	cancel()
+	select {
+	case <-reaped:
+	case <-time.After(childKillGrace + 3*time.Second):
+		t.Fatal("child still alive after ctx cancel + grace")
+	}
+	d := time.Since(start)
+	if d < childKillGrace-500*time.Millisecond {
+		t.Errorf("child reaped after %v, want >= ~%v (SIGTERM should have been ignored)", d, childKillGrace)
+	}
+	if d > childKillGrace+3*time.Second {
+		t.Errorf("child reaped after %v, want <= %v", d, childKillGrace+3*time.Second)
+	}
+	ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok {
+		t.Fatalf("ProcessState.Sys() = %T, want syscall.WaitStatus", cmd.ProcessState.Sys())
+	}
+	if !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
+		t.Errorf("child termination = %v, want death by SIGKILL", ws)
 	}
 }

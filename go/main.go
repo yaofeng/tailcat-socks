@@ -37,8 +37,17 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	// Install the signal handler before doing anything else: the child's life
 	// is bound to ctx, so SIGINT/SIGTERM arriving during launch must already
 	// cancel it — otherwise the tailcat child would be orphaned.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	//
+	// Two layers: notifyCtx is canceled by SIGINT/SIGTERM, and ctx is derived
+	// from it plus our own cancel() calls. stopNotify is deferred FIRST so it
+	// runs LAST: the handler stays installed until run() actually returns, so
+	// repeat signals keep being swallowed while we stop and reap the child —
+	// a second Ctrl-C must never hit the default disposition and kill us
+	// mid-reap, orphaning the child.
+	notifyCtx, stopNotify := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopNotify()
+	ctx, cancel := context.WithCancel(notifyCtx)
+	defer cancel()
 
 	first, err := LoadDNSFile(dnsFile)
 	if err != nil {
@@ -101,14 +110,22 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 			childErr = child.Wait()
 			close(childDone)
 		}()
-		if !waitReady(upAddr, 15*time.Second) {
-			slog.Error("upstream not ready; aborting", "addr", upAddr)
-			stop() // cancels ctx: SIGTERM to the child, SIGKILL after childKillGrace
+		if !waitReady(ctx, upAddr, 15*time.Second) {
+			// Two ways to land here: a signal arrived mid-wait (ctx is
+			// canceled, the child is already being stopped — a clean, quiet
+			// shutdown, exit 0), or the child genuinely failed to come up
+			// (loud, exit 1).
+			code := 0
+			if ctx.Err() == nil {
+				slog.Error("upstream not ready; aborting", "addr", upAddr)
+				code = 1
+			}
+			cancel() // SIGTERM to the child, SIGKILL after childKillGrace
 			srv.Close()
 			if child != nil {
 				<-childDone
 			}
-			return 1
+			return code
 		}
 		slog.Info("auto-launched tailcat socks", "bin", tailcatBin, "addr", upAddr)
 	}
@@ -126,6 +143,18 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 	slog.Info("dns map loaded", "domains", len(first), "tokens", len(tokenSet(first)))
 	slog.Info("using upstream", "addr", upAddr)
 
+	// Determinism when events race: if the child is already gone by the time
+	// we reach the select, attribute the shutdown to the child even if a
+	// signal arrived too — otherwise select would pick between the two cases
+	// at random and the exit code would be a coin flip.
+	code := 0
+	select {
+	case <-childDone:
+		logChildExit(child, childErr)
+		code = 1
+	default:
+	}
+
 	select {
 	case <-ctx.Done():
 	case err := <-serveErr:
@@ -138,21 +167,27 @@ func run(listen, dnsFile, upstream, tailcatBin string, noAutolaunch, noWatch boo
 		// The tailcat child died on its own; without an upstream we are
 		// useless, so surface why and exit nonzero. (childDone is nil in
 		// --no-autolaunch mode, which a select never readies on.)
-		if childErr != nil {
-			slog.Error("tailcat socks exited", "err", childErr)
-		} else {
-			slog.Error("tailcat socks exited unexpectedly")
-		}
-		srv.Close()
-		return 1
+		logChildExit(child, childErr)
+		code = 1
 	}
-	stop() // cancels ctx: SIGTERM to the child (then SIGKILL), harmless without one
+	cancel() // stops the child if alive: SIGTERM, then SIGKILL; harmless without one
 	close(stopWatch)
 	srv.Close()
 	if child != nil {
 		<-childDone // reap the child before exiting so it cannot outlive us
 	}
-	return 0
+	return code
+}
+
+// logChildExit reports the tailcat child's death. It must only be called once
+// childDone is closed: that close is the happens-before edge ordering
+// childErr and child.ProcessState (both written by Wait) before any read.
+func logChildExit(child *exec.Cmd, childErr error) {
+	if childErr != nil {
+		slog.Error("tailcat socks exited", "err", childErr)
+	} else {
+		slog.Error("tailcat socks exited unexpectedly", "code", child.ProcessState.ExitCode())
+	}
 }
 
 // upstreamAddr validates the --upstream flag value and returns the address to
@@ -204,16 +239,30 @@ func spawnTailcatSocks(ctx context.Context, binPath, addr string) (*exec.Cmd, er
 	return cmd, nil
 }
 
-// waitReady polls TCP-connect to addr until it accepts or the timeout hits.
-func waitReady(addr string, timeout time.Duration) bool {
+// waitReady polls TCP-connect to addr until it accepts, the timeout hits, or
+// ctx is canceled — cancellation returns promptly so a shutdown during launch
+// is not held hostage by the remaining deadline.
+func waitReady(ctx context.Context, addr string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, time.Second)
+	d := net.Dialer{Timeout: time.Second}
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		conn, err := d.DialContext(ctx, "tcp", addr)
 		if err == nil {
 			conn.Close()
 			return true
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
-	return false
 }

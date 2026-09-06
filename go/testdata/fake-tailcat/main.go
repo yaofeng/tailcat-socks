@@ -9,9 +9,16 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
+	// With FAKE_TAILCAT_IGNORE_TERM set the process shrugs off SIGTERM,
+	// letting tests pin the SIGKILL leg of the supervisor's shutdown ladder.
+	if os.Getenv("FAKE_TAILCAT_IGNORE_TERM") != "" {
+		signal.Ignore(syscall.SIGTERM)
+	}
 	// Like the real `tailcat socks --listen=...`, the subcommand comes before
 	// the flag; Go's flag package stops at the first non-flag argument, so
 	// drop a leading "socks" before parsing.
