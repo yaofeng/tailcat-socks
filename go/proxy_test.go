@@ -652,6 +652,8 @@ func TestSocks5ProxyHandshakeIdleClosesSlowClient(t *testing.T) {
 	n, err := conn.Read(buf)
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Errorf("slow client closed after %v, want ~handshakeTimeout (200ms)", elapsed)
+	} else if elapsed < 100*time.Millisecond {
+		t.Errorf("slow client dropped after %v, before the 200ms handshake deadline could expire", elapsed)
 	}
 	if err == nil {
 		t.Fatalf("silent client got data (%d bytes) instead of being dropped", n)

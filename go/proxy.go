@@ -109,8 +109,10 @@ func socksFail(client net.Conn) {
 // serveConn runs the SOCKS5 exchange on one connection, mirroring the Python
 // version byte-for-byte (greeting, CONNECT-only, ATYP 1/3/4, socks5h).
 func (s *Server) serveConn(client net.Conn) {
-	// Bound the whole handshake through the OK/fail reply below; the early
-	// return paths keep it armed — we close the conn right after anyway.
+	// Bound the client-facing handshake reads; the early return paths keep
+	// it armed — we close the conn right after anyway. The upstream dial is
+	// bounded by upstreamDialTimeout, and the reply below re-arms this
+	// deadline so a slow dial cannot silently consume the reply window.
 	client.SetDeadline(time.Now().Add(s.handshakeTimeout))
 
 	// --- greeting ---
@@ -137,7 +139,7 @@ func (s *Server) serveConn(client net.Conn) {
 		}
 	}
 	if !noAuth {
-		_, _ = client.Write([]byte{0x05, 0xFF}) // no acceptable methods; best-effort like the other replies
+		_, _ = client.Write([]byte{0x05, 0xFF}) // no acceptable methods; best-effort like the failure replies
 		return
 	}
 	if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
@@ -171,12 +173,18 @@ func (s *Server) serveConn(client net.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), upstreamDialTimeout)
 	defer cancel()
 	up, err := s.dialUpstream(ctx, target, port)
+	// The upstream phase may have consumed the handshake budget; give the
+	// reply a fresh window (success or failure) so a slow dial cannot
+	// silently eat it.
+	client.SetDeadline(time.Now().Add(s.handshakeTimeout))
 	if err != nil {
 		socksFail(client)
 		return
 	}
-	// Still under the handshake deadline: best-effort, but not unbounded.
-	_, _ = client.Write(socksOKReply)
+	if _, err := client.Write(socksOKReply); err != nil {
+		up.Close() // client never learned CONNECT succeeded; no relay for it
+		return
+	}
 
 	// Handshake over; relay's idle timer governs both legs from here.
 	client.SetDeadline(time.Time{})
