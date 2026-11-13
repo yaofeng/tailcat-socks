@@ -440,6 +440,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -447,7 +449,7 @@ import (
 )
 
 func TestRoute(t *testing.T) {
-	m := map[string]string{"www.example.com": "tcXYZabc", "dup.com": "tcSecond"}
+	m := map[string]string{"www.example.com": "tcXYZabc", "dup.com": "tcSecond", "self.example.com": "self.example.com"}
 	tests := []struct {
 		name       string
 		host       string
@@ -461,6 +463,8 @@ func TestRoute(t *testing.T) {
 		{"unmapped domain direct", "other.com", 9999, ViaDirect, "other.com"},
 		{"IPv4 literal direct", "93.184.216.34", 80, ViaDirect, "93.184.216.34"},
 		{"IPv6 literal direct", "2001:db8::1", 443, ViaDirect, "2001:db8::1"},
+		// 手滑条目 token 恰等于 domain：必须仍按命中处理（隧道），不许静默直连。
+		{"self-equal token still tunnels", "self.example.com", 443, ViaTunnel, "self.example.com"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -469,6 +473,51 @@ func TestRoute(t *testing.T) {
 				t.Errorf("route(%q,%d) = %+v, want {%s %s %d}", tt.host, tt.port, got, tt.wantVia, tt.wantTarget, tt.port)
 			}
 		})
+	}
+}
+
+// TestClientKeyFileModePinned：私钥文件必须钉死 0600——WriteFile 的 perm 受
+// umask 过滤，严格 umask（0177）下不 Chmod 会落成 0400。
+func TestClientKeyFileModePinned(t *testing.T) {
+	old := syscall.Umask(0o177)
+	defer syscall.Umask(old)
+	path := filepath.Join(t.TempDir(), "client-key")
+	d := NewAppDialer(path)
+	defer d.Close()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("key file mode = %O under umask 0177, want 0600", fi.Mode().Perm())
+	}
+}
+
+// TestClientForConcurrentSameToken：并发 clientFor 同一 token 只许创建一个
+// client（查+建全程在锁内；锁不跨网络拨号）。
+func TestClientForConcurrentSameToken(t *testing.T) {
+	d := NewAppDialer(filepath.Join(t.TempDir(), "k"))
+	defer d.Close()
+	var mu sync.Mutex
+	seen := map[*tailcat.Client]bool{}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := d.clientFor("tcXYZabc123")
+			if err != nil {
+				t.Errorf("clientFor: %v", err)
+				return
+			}
+			mu.Lock()
+			seen[c] = true
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if len(seen) != 1 {
+		t.Errorf("created %d distinct clients for one token, want 1", len(seen))
 	}
 }
 
@@ -587,6 +636,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -619,10 +669,12 @@ type Dialer interface {
 	Close() error
 }
 
-// route 决定去向：命中 dns.txt 的域名交隧道（RewriteHost 大小写不敏感匹配、
-// 返回原样 token），其余——未命中域名与 IP 字面量一律——直接 TCP 拨号。
+// route 决定去向：命中 dns.txt 的域名交隧道（大小写不敏感匹配、token 原样
+// 返回），其余——未命中域名与 IP 字面量一律——直接 TCP 拨号。用显式 ok 查找
+// 而非 RewriteHost 的 token!=host 哨兵：手滑条目 token 恰等于 domain 时，
+// 哨兵会把本该隧道化的流量静默放行成明文直连。
 func route(host string, port uint16, m map[string]string) Target {
-	if token := RewriteHost(host, m); token != host {
+	if token, ok := m[strings.ToLower(host)]; ok {
 		return Target{Via: ViaTunnel, Host: token, Port: port}
 	}
 	return Target{Via: ViaDirect, Host: host, Port: port}
@@ -658,17 +710,22 @@ func loadOrCreateClientKey(path string) key.NodePrivate {
 	switch {
 	case err == nil:
 		var conf tailcat.PrivateKey
-		if err := json.Unmarshal(data, &conf); err == nil && !conf.Private.IsZero() {
+		perr := json.Unmarshal(data, &conf)
+		if perr == nil && !conf.Private.IsZero() {
 			return conf.Private
 		}
-		slog.Warn("client key file is corrupt; using an ephemeral key (file left untouched)", "path", path)
+		// perr==nil 而 IsZero 时 err 记 null：两种坏法都值得一行日志原文。
+		slog.Warn("client key file is corrupt; using an ephemeral key (file left untouched)", "path", path, "err", perr)
 		return key.NewNode()
 	case errors.Is(err, fs.ErrNotExist):
 		conf := tailcat.NewPrivateKey()
-		if b, merr := json.MarshalIndent(conf, "", "  "); merr == nil {
-			if werr := os.WriteFile(path, b, 0o600); werr != nil {
-				slog.Warn("cannot persist client key; identity will not survive restarts", "path", path, "err", werr)
-			}
+		if b, merr := json.MarshalIndent(conf, "", "  "); merr != nil {
+			slog.Warn("cannot encode client key; identity will not survive restarts", "path", path, "err", merr)
+		} else if werr := os.WriteFile(path, b, 0o600); werr != nil {
+			slog.Warn("cannot persist client key; identity will not survive restarts", "path", path, "err", werr)
+		} else if cerr := os.Chmod(path, 0o600); cerr != nil {
+			// WriteFile 的 perm 会被 umask 过滤；Chmod 钉死 0600（私钥文件）。
+			slog.Warn("cannot pin client key file mode", "path", path, "err", cerr)
 		}
 		return conf.Private
 	default:
