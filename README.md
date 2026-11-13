@@ -133,7 +133,7 @@ tailcat-socks/
 │   └── testdata/fake-tailcat/        # 测试用假 tailcat
 ├── bin/                              # 启停脚本 {start,stop,restart}.sh + 构建产物 tailcat-socks(gitignore)
 ├── docker/{Dockerfile,docker-compose.yml}
-├── docs/superpowers/                 # 设计文档与实现计划(含已删除的 Python/Rust 版历史)
+├── docs/superpowers/                 # Go 版设计文档与实现计划
 ├── data/
 │   ├── dns.txt                       # 域名→token 映射(运行时热加载,gitignore)
 │   └── dns.txt.example               # 示例映射
