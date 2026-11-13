@@ -2614,6 +2614,32 @@ func TestHandlePutDNSMalformedJSON(t *testing.T) {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
+
+func TestHandlePutDNSBodyTooLarge(t *testing.T) {
+	admin, _, dnsMap, path := newAdminFixture(t)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ~2.3 MB，超过 1 MiB 上限；条目本身合法——MaxBytesReader 在 Decode 读到
+	// 上限时即触发，与内容合法性无关。
+	body := "[" + strings.Repeat(`{"token":"tcAAA111","domains":["a.example.com"],"note":""},`, 40000) + "]"
+	rec := httptest.NewRecorder()
+	admin.Handler().ServeHTTP(rec, httptest.NewRequest("PUT", "/api/dns", strings.NewReader(body)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (1 MiB body cap)", rec.Code)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("oversized PUT must not touch dns.txt:\n%s", after)
+	}
+	if got := len(dnsMap.Load()); got != 3 {
+		t.Errorf("dnsMap changed despite 400: %d domains, want 3", got)
+	}
+}
 ```
 
 - [ ] **Step 5.2 运行确认编译失败**：
@@ -2727,6 +2753,10 @@ func (a *Admin) handleGetDNS(w http.ResponseWriter, r *http.Request) {
 // 的 50ms 防抖，"保存即生效"（spec §7）。校验失败/写失败都不碰映射；
 // 写成功但 reload 失败时文件已是新内容而 map 还是旧内容，如实告诉页面。
 func (a *Admin) handlePutDNS(w http.ResponseWriter, r *http.Request) {
+	// 请求体上限 1 MiB：dns.txt 是人规模配置，且 admin 与 SOCKS 代理同进程——
+	// spec §11 允许 ADMIN_ADDR=0.0.0.0，不设上限的大 JSON 能打死整个进程。
+	// 超限在 Decode 处以错误呈现，走 400，不碰文件与映射。
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var entries []Entry
 	if err := json.NewDecoder(r.Body).Decode(&entries); err != nil {
 		httpError(w, http.StatusBadRequest, "请求体不是合法的 entries JSON: "+err.Error())
