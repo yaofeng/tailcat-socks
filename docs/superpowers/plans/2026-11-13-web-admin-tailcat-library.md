@@ -1165,6 +1165,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Files:**
 - Delete: `src/main_test.go`、`src/testdata/fake-tailcat/`（整个目录）
 - Rewrite: `src/proxy_test.go`、`src/proxy.go`、`src/main.go`
+- Modify: `src/stats.go`（Opened 字段约定注释）、`src/stats_test.go`（并发 churn 护栏测试）——Task 3 质量审查遗留，见 Step 4.6
 
 - [ ] **Step 4.1 删除子进程时代的测试与夹具**：
 
@@ -2267,7 +2268,58 @@ func run(listen, dnsFile, clientKeyFile string, noWatch bool) int {
 
 行为变化说明（相对旧 main.go）：`--upstream`/`--tailcat-bin`/`--no-autolaunch` 三个 flag 与 `upstreamAddr`/`spawnTailcatSocks`/`waitReady`/`logChildExit`/`childKillGrace` 及 `childDone` select 分支整体删除；"using upstream" 日志删除；import 去掉 `os/exec` 与 `time`；`serveErr` 非 ErrClosed 错误现在置 `code = 1`（旧实现只记日志仍退 0——绑定成功后监听器真坏了，退出码应当非零）。
 
-- [ ] **Step 4.6 全量测试 + race + vet**：
+- [ ] **Step 4.6 Registry 并发 churn 回归（Task 3 质量审查遗留）**：
+
+  a) `src/stats.go` 的 Session 结构里，把裸的 `Opened bool` 字段改为（注释+字段）：
+
+  ```go
+  	// Opened 只许经 ConnRegistry.MarkOpen 写：与 Snapshot 的读同受 registry
+  	// 锁保护，禁止任何直接赋值（会竞态 Snapshot）。
+  	Opened bool
+  ```
+
+  b) `src/stats_test.go` 末尾追加（import 若无 `"sync"` 则补上）：
+
+  ```go
+  // TestConnRegistryConcurrentChurn：New/MarkOpen/Drop/Snapshot 并发外加原子
+  // 计数必须 -race 干净；sessionsTotal 的 !Opened 去重在 churn 下不许虚增。
+  func TestConnRegistryConcurrentChurn(t *testing.T) {
+  	reg := NewConnRegistry()
+  	var wg sync.WaitGroup
+  	for i := 0; i < 8; i++ {
+  		s := reg.New("c", "h", "t", 1, ViaDirect)
+  		wg.Add(3)
+  		go func() {
+  			defer wg.Done()
+  			for j := 0; j < 200; j++ {
+  				s.BytesUp.Add(1)
+  				s.BytesDown.Add(2)
+  			}
+  		}()
+  		go func() {
+  			defer wg.Done()
+  			reg.MarkOpen(s)
+  			reg.Drop(s.ID)
+  		}()
+  		go func() {
+  			defer wg.Done()
+  			for j := 0; j < 200; j++ {
+  				reg.Snapshot()
+  			}
+  		}()
+  	}
+  	wg.Wait()
+  	_, tot := reg.Snapshot()
+  	if tot.SessionsTotal != 8 || tot.Active != 0 {
+  		t.Errorf("after churn Totals=%+v, want {Active:0 SessionsTotal:8}", tot)
+  	}
+  }
+  ```
+
+  Run: `cd /data/yaofeng/workspace/popeye/tailcat-socks/src && GOPROXY=https://goproxy.cn,direct go test -count=1 -race -run ConnRegistry ./...`
+  Expected: PASS——这是护栏测试（现实现本就应该通过）；若 FAIL，停下上报 BLOCKED，说明并发实现真有缺陷，别改测试来迁就。
+
+- [ ] **Step 4.7 全量测试 + race + vet**：
 
   ```bash
   cd /data/yaofeng/workspace/popeye/tailcat-socks/src
@@ -2276,7 +2328,7 @@ func run(listen, dnsFile, clientKeyFile string, noWatch bool) int {
   ```
   Expected: 全部 PASS（race 干净）、vet 无输出。
 
-- [ ] **Step 4.7 提交**：
+- [ ] **Step 4.8 提交**：
 
   ```bash
   cd /data/yaofeng/workspace/popeye/tailcat-socks
