@@ -477,11 +477,15 @@ func TestRoute(t *testing.T) {
 }
 
 // TestClientKeyFileModePinned：私钥文件必须钉死 0600——WriteFile 的 perm 受
-// umask 过滤，严格 umask（0177）下不 Chmod 会落成 0400。
+// umask 过滤，严格 umask（0377）下不 Chmod 会落成 0400。
+// （计划的 0177 屏蔽的是 owner 的 x 位而非 w 位，对 0600 文件无损，
+// 起不到检测作用，故改用 0377。）
 func TestClientKeyFileModePinned(t *testing.T) {
-	old := syscall.Umask(0o177)
-	defer syscall.Umask(old)
+	// 先取 t.TempDir() 再设 umask：严格 umask 下 MkdirTemp 自己的
+	// 0700 目录位会被过滤（缺 owner x），TempDir 直接 permission denied。
 	path := filepath.Join(t.TempDir(), "client-key")
+	old := syscall.Umask(0o377)
+	defer syscall.Umask(old)
 	d := NewAppDialer(path)
 	defer d.Close()
 	fi, err := os.Stat(path)
@@ -489,7 +493,7 @@ func TestClientKeyFileModePinned(t *testing.T) {
 		t.Fatal(err)
 	}
 	if fi.Mode().Perm() != 0o600 {
-		t.Errorf("key file mode = %O under umask 0177, want 0600", fi.Mode().Perm())
+		t.Errorf("key file mode = %O under umask 0377, want 0600", fi.Mode().Perm())
 	}
 }
 
@@ -501,11 +505,15 @@ func TestClientForConcurrentSameToken(t *testing.T) {
 	var mu sync.Mutex
 	seen := map[*tailcat.Client]bool{}
 	var wg sync.WaitGroup
+	// 必须用能通过 ParseAddr 的合法地址："tcXYZabc123" 的尾串不是
+	// base64(CBOR) wire 编码，会被 clientFor 直接拒掉。NewPrivateKey
+	// 纯离线生成，Public.Addr() 是其官方序列化，绝不触网。
+	token := string(tailcat.NewPrivateKey().Public.Addr())
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c, err := d.clientFor("tcXYZabc123")
+			c, err := d.clientFor(token)
 			if err != nil {
 				t.Errorf("clientFor: %v", err)
 				return
