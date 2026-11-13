@@ -206,7 +206,7 @@ func ValidateEntries(entries []Entry) error {
 			return fmt.Errorf("条目%d: token 不能以 # 开头", n)
 		}
 		if strings.ContainsAny(e.Token, " \t\r\n") {
-			return fmt.Errorf("条目%d: 包含空白", n)
+			return fmt.Errorf("条目%d: token 不能包含空白", n)
 		}
 		if !strings.HasPrefix(e.Token, "tc") {
 			slog.Warn("token lacks the tc prefix (tailcat addresses normally start with it)", "entry", n, "token", e.Token)
