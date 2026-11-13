@@ -10,13 +10,15 @@ import (
 // serveConn 结束注销。字节数走原子计数，relay 热路径不碰 registry 锁；
 // Opened 由 registry 互斥保护（只在 SOCKS 成功回执时翻转一次）。
 type Session struct {
-	ID      uint64
-	Client  string // 客户端 socket 的对端地址
-	Host    string // 客户端请求的原始域名
-	Target  string // token（tunnel）或 host（direct）
-	Port    int
-	Via     string // ViaTunnel / ViaDirect
-	Opened  bool   // 已发成功回执；计入过 sessionsTotal
+	ID     uint64
+	Client string // 客户端 socket 的对端地址
+	Host   string // 客户端请求的原始域名
+	Target string // token（tunnel）或 host（direct）
+	Port   int
+	Via    string // ViaTunnel / ViaDirect
+	// Opened 只许经 ConnRegistry.MarkOpen 写：与 Snapshot 的读同受 registry
+	// 锁保护，禁止任何直接赋值（会竞态 Snapshot）。
+	Opened  bool
 	Started time.Time
 
 	BytesUp   atomic.Uint64 // client -> target

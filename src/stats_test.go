@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -72,5 +73,39 @@ func TestIdleConnCountsBytes(t *testing.T) {
 	ic2 := &idleConn{Conn: proxy, onActivity: func() {}}
 	if _, err := ic2.Read(make([]byte, 1)); err == nil {
 		t.Error("closed pipe: want read error")
+	}
+}
+
+// TestConnRegistryConcurrentChurn：New/MarkOpen/Drop/Snapshot 并发外加原子
+// 计数必须 -race 干净；sessionsTotal 的 !Opened 去重在 churn 下不许虚增。
+func TestConnRegistryConcurrentChurn(t *testing.T) {
+	reg := NewConnRegistry()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		s := reg.New("c", "h", "t", 1, ViaDirect)
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				s.BytesUp.Add(1)
+				s.BytesDown.Add(2)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			reg.MarkOpen(s)
+			reg.Drop(s.ID)
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				reg.Snapshot()
+			}
+		}()
+	}
+	wg.Wait()
+	_, tot := reg.Snapshot()
+	if tot.SessionsTotal != 8 || tot.Active != 0 {
+		t.Errorf("after churn Totals=%+v, want {Active:0 SessionsTotal:8}", tot)
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -15,14 +14,14 @@ import (
 )
 
 const (
-	upstreamDialTimeout = 15 * time.Second
 	// relayIdleTimeout mirrors the Python version: the relay breaks after
 	// 300s with no reads of real bytes in either direction (only reads
 	// re-arm the window; writes never do).
 	relayIdleTimeout = 300 * time.Second
 	// handshakeTimeout bounds the client-facing SOCKS5 handshake (greeting,
-	// request parse, upstream CONNECT, and our reply) so a silent or stalled
-	// client cannot pin a goroutine and fd forever. Cleared before relaying.
+	// request parse, and our reply) so a silent or stalled client cannot pin
+	// a goroutine and fd forever. Cleared before relaying. The dial budget
+	// lives with the Dialer (dialTimeout in dialer.go).
 	handshakeTimeout = 15 * time.Second
 )
 
@@ -32,13 +31,15 @@ var (
 	socksFailReply = []byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 )
 
-// Server is the client-facing SOCKS5 front proxy. On each CONNECT it
-// rewrites the target host via DNSMap and forwards the request (as a SOCKS5
-// client) to the single `tailcat socks` upstream.
+// Server is the client-facing SOCKS5 front proxy. On each CONNECT it routes
+// the target (see route in dialer.go): domains mapped in dns.txt are dialed
+// through the in-process tailcat library, everything else directly; the
+// established pair is relayed and accounted in Registry for the admin page.
 type Server struct {
-	DNSMap       *DNSMap
-	UpstreamAddr string
-	ln           net.Listener
+	DNSMap   *DNSMap
+	Dialer   Dialer
+	Registry *ConnRegistry
+	ln       net.Listener
 	// relayIdle is how long the relay tolerates silence in either direction
 	// before tearing the session down.
 	relayIdle time.Duration
@@ -49,12 +50,12 @@ type Server struct {
 
 // NewServer binds the listen address. Use ActualAddr for the resolved port
 // (listening on port 0 is useful in tests).
-func NewServer(dnsMap *DNSMap, upstreamAddr, listen string) (*Server, error) {
+func NewServer(dnsMap *DNSMap, d Dialer, reg *ConnRegistry, listen string) (*Server, error) {
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return nil, err
 	}
-	return &Server{DNSMap: dnsMap, UpstreamAddr: upstreamAddr, ln: ln, relayIdle: relayIdleTimeout, handshakeTimeout: handshakeTimeout}, nil
+	return &Server{DNSMap: dnsMap, Dialer: d, Registry: reg, ln: ln, relayIdle: relayIdleTimeout, handshakeTimeout: handshakeTimeout}, nil
 }
 
 // ActualAddr returns the bound address once NewServer has succeeded.
@@ -108,12 +109,13 @@ func socksFail(client net.Conn) {
 }
 
 // serveConn runs the SOCKS5 exchange on one connection, mirroring the Python
-// version byte-for-byte (greeting, CONNECT-only, ATYP 1/3/4, socks5h).
+// version byte-for-byte (greeting, CONNECT-only, ATYP 1/3/4, socks5h), then
+// routes the target through the Dialer and relays the pair.
 func (s *Server) serveConn(client net.Conn) {
 	// Bound the client-facing handshake reads; the early return paths keep
-	// it armed — we close the conn right after anyway. The upstream dial is
-	// bounded by upstreamDialTimeout, and the reply below re-arms this
-	// deadline so a slow dial cannot silently consume the reply window.
+	// it armed — we close the conn right after anyway. The dial is bounded
+	// by the Dialer's own budget, and the reply below re-arms this deadline
+	// so a slow dial cannot silently consume the reply window.
 	client.SetDeadline(time.Now().Add(s.handshakeTimeout))
 
 	// --- greeting ---
@@ -168,29 +170,30 @@ func (s *Server) serveConn(client net.Conn) {
 		return
 	}
 
-	target := RewriteHost(host, s.DNSMap.Load())
+	target := route(host, port, s.DNSMap.Load())
+	sess := s.Registry.New(client.RemoteAddr().String(), host, target.Host, int(target.Port), target.Via)
+	defer s.Registry.Drop(sess.ID)
 
-	// --- forward to upstream as a SOCKS5 client ---
-	ctx, cancel := context.WithTimeout(context.Background(), upstreamDialTimeout)
-	defer cancel()
-	up, err := s.dialUpstream(ctx, target, port)
-	// The upstream phase may have consumed the handshake budget; give the
-	// reply a fresh window (success or failure) so a slow dial cannot
-	// silently eat it.
+	up, err := s.Dialer.Dial(context.Background(), target)
+	// The dial may have consumed the handshake budget; give the reply a
+	// fresh window (success or failure) so a slow dial cannot silently eat
+	// it.
 	client.SetDeadline(time.Now().Add(s.handshakeTimeout))
 	if err != nil {
-		socksFail(client)
+		slog.Debug("dial failed", "via", target.Via, "host", host, "err", err)
+		socksFail(client) // 未 MarkOpen：失败的会话不进 sessionsTotal
 		return
 	}
 	if _, err := client.Write(socksOKReply); err != nil {
 		up.Close() // client never learned CONNECT succeeded; no relay for it
 		return
 	}
+	s.Registry.MarkOpen(sess)
 
 	// Handshake over; relay's idle timer governs both legs from here.
 	client.SetDeadline(time.Time{})
-	up.SetDeadline(time.Time{})    // dialUpstream hands back a deadline-free conn; kept for clarity
-	relay(client, up, s.relayIdle) // relay owns both conns and closes them
+	up.SetDeadline(time.Time{})          // the Dialer hands back deadline-free conns; kept for clarity
+	relay(client, up, s.relayIdle, sess) // relay owns both conns and closes them
 }
 
 // readATYPAddr reads a SOCKS5 address of the given ATYP and returns it as a
@@ -205,7 +208,7 @@ func readATYPAddr(r io.Reader, atyp byte) (string, error) {
 		return net.IP(b[:]).String(), nil
 	case 0x03: // domain
 		// Deliberate divergence from Python: Python's ascii decode drops
-		// non-ASCII domain bytes, Go forwards them raw and lets the upstream
+		// non-ASCII domain bytes, Go forwards them raw and lets the dial
 		// reject — both fail the session, no wrong-destination risk.
 		var l [1]byte
 		if _, err := io.ReadFull(r, l[:]); err != nil {
@@ -226,97 +229,6 @@ func readATYPAddr(r io.Reader, atyp byte) (string, error) {
 	return "", fmt.Errorf("unsupported ATYP %d", atyp)
 }
 
-// dialUpstream opens the chained SOCKS5 connection to the upstream, passing
-// host through as a domain (ATYP 0x03) when it is not an IP literal. The
-// handshake is hand-rolled rather than using golang.org/x/net/proxy because
-// that dialer hands back an opaque conn wrapper without CloseWrite/CloseRead
-// (and not a *net.TCPConn), which would silently disable the relay's
-// FIN-first, anti-RST teardown on the upstream leg. The CONNECT request is
-// encoded before the TCP connect, so an over-long domain is rejected without
-// a single byte leaving here; the ctx deadline bounds the whole
-// dial+CONNECT exchange.
-func (s *Server) dialUpstream(ctx context.Context, host string, port uint16) (net.Conn, error) {
-	req, err := socksConnectRequest(host, port)
-	if err != nil {
-		return nil, fmt.Errorf("upstream CONNECT %s: %w", net.JoinHostPort(host, strconv.Itoa(int(port))), err)
-	}
-	d := &net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", s.UpstreamAddr)
-	if err != nil {
-		return nil, fmt.Errorf("dial upstream %s: %w", s.UpstreamAddr, err)
-	}
-	if err := socksClientConnect(ctx, conn, req); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("upstream CONNECT %s: %w", net.JoinHostPort(host, strconv.Itoa(int(port))), err)
-	}
-	return conn, nil
-}
-
-// socksConnectRequest encodes a SOCKS5 CONNECT request for host:port: IPv4
-// and IPv6 literals go out as ATYP 0x01/0x04, anything else as a domain
-// (ATYP 0x03) so the upstream resolves it (socks5h semantics). A domain
-// longer than the 255-byte length field is rejected here — the old encoder
-// wrapped byte(len(host)) silently and shipped a truncated token upstream.
-func socksConnectRequest(host string, port uint16) ([]byte, error) {
-	var addr []byte
-	if ip := net.ParseIP(host); ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			addr = append([]byte{0x01}, ip4...)
-		} else {
-			addr = append([]byte{0x04}, ip.To16()...)
-		}
-	} else {
-		if len(host) > 255 {
-			return nil, fmt.Errorf("target %q: FQDN too long", host)
-		}
-		addr = append([]byte{0x03, byte(len(host))}, host...)
-	}
-	return append(append([]byte{0x05, 0x01, 0x00}, addr...), byte(port>>8), byte(port)), nil
-}
-
-// socksClientConnect performs the greeting + CONNECT exchange on an already
-// dialed upstream conn using the pre-encoded request. The conn's deadline is
-// set from ctx for the handshake and cleared on success, so the relay phase
-// is governed by the shared idle timer alone. net.Conn.Write is
-// full-write-or-error by its io.Writer contract, so the err checks below are
-// also the short-write checks.
-func socksClientConnect(ctx context.Context, conn net.Conn, req []byte) error {
-	if dl, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(dl); err != nil {
-			return err
-		}
-	}
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		return err
-	}
-	var greet [2]byte
-	if _, err := io.ReadFull(conn, greet[:]); err != nil {
-		return err
-	}
-	if greet[0] != 0x05 || greet[1] != 0x00 {
-		return errors.New("upstream refused the greeting")
-	}
-	if _, err := conn.Write(req); err != nil {
-		return err
-	}
-	var rep [4]byte
-	if _, err := io.ReadFull(conn, rep[:]); err != nil {
-		return err
-	}
-	if rep[0] != 0x05 || rep[1] != 0x00 {
-		return fmt.Errorf("upstream refused (reply 0x%02x)", rep[1])
-	}
-	// drain BND.ADDR/BND.PORT, reusing the server-side address parser
-	if _, err := readATYPAddr(conn, rep[3]); err != nil {
-		return err
-	}
-	var bnd [2]byte
-	if _, err := io.ReadFull(conn, bnd[:]); err != nil {
-		return err
-	}
-	return conn.SetDeadline(time.Time{})
-}
-
 // relay copies data between client and upstream in both directions until
 // either side closes. One shared idle timer covers both directions: any read
 // of real bytes re-arms it, so a healthy one-way transfer (e.g. a long
@@ -330,10 +242,10 @@ func socksClientConnect(ctx context.Context, conn net.Conn, req []byte) error {
 // the forward half-close property — is that a peer which half-closes and
 // then falls silent keeps the relay (both goroutines plus the timer) alive
 // for up to the full idle window.
-func relay(client, upstream net.Conn, idle time.Duration) {
+func relay(client, upstream net.Conn, idle time.Duration, sess *Session) {
 	var once sync.Once
 	// stop closes the conns relay was handed; halfClose reaches the socket
-	// through tcpOf, which unwraps the idleConn wrappers below, so the
+	// through halfOf, which unwraps the idleConn wrappers below, so the
 	// teardown works on wrapped or raw conns alike.
 	stop := func() {
 		// The peer's socket may still hold unread bytes in our kernel receive
@@ -353,8 +265,9 @@ func relay(client, upstream net.Conn, idle time.Duration) {
 	idleTimer := time.AfterFunc(idle, func() { once.Do(stop) })
 	defer idleTimer.Stop()
 	wake := func() { idleTimer.Reset(idle) }
-	wrappedClient := &idleConn{Conn: client, onActivity: wake}
-	wrappedUpstream := &idleConn{Conn: upstream, onActivity: wake}
+	// 方向天然正确：读客户端腿=上行、读目标腿=下行（spec §6）。
+	wrappedClient := &idleConn{Conn: client, onActivity: wake, count: &sess.BytesUp}
+	wrappedUpstream := &idleConn{Conn: upstream, onActivity: wake, count: &sess.BytesDown}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -362,12 +275,21 @@ func relay(client, upstream net.Conn, idle time.Duration) {
 		defer wg.Done()
 		if _, err := io.Copy(wrappedUpstream, wrappedClient); err == nil {
 			closeWrite(wrappedUpstream)
+		} else {
+			// Hard abort (RST/timeout), not a clean EOF: the failed peer
+			// can never send again, so the session is over as a whole.
+			// Blocking in wg.Wait for the other direction would pin both
+			// legs until the idle timer — and keep the client's FIN from
+			// ever arriving.
+			once.Do(stop)
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		if _, err := io.Copy(wrappedClient, wrappedUpstream); err == nil {
 			closeWrite(wrappedClient)
+		} else {
+			once.Do(stop)
 		}
 	}()
 	wg.Wait()
