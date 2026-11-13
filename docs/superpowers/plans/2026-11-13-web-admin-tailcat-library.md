@@ -90,7 +90,9 @@ tcDEF456ghi foo.com # 行尾井号不是注释
 		t.Errorf("entry1.Note = %q, want empty", e1.Note)
 	}
 	// 行尾 # 只是普通字段（Fields 语义），由校验层在保存时拒绝，而不是解析层。
-	if len(e1.Domains) != 2 || e1.Domains[1] != "#" {
+	// Fields splits the trailing "# 行尾井号不是注释" into two MORE fields, so
+	// Domains is [foo.com # 行尾井号不是注释]: the "#" is just a field.
+	if len(e1.Domains) != 3 || e1.Domains[1] != "#" {
 		t.Errorf("entry1.Domains = %v", e1.Domains)
 	}
 }
