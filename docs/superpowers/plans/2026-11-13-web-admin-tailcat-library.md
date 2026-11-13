@@ -3107,7 +3107,7 @@ pollConn();
 
 - [ ] **Step 6.4 修改 `src/admin.go`**：
 
-a) 不新增 import：`//go:embed` 嵌单个文件进 `string` 类型不要求导入 `embed` 包（只有 `embed.FS` 才需要）。
+a) import 块**首行加一行** `_ "embed"`：凡含 `//go:embed` 指令的文件，编译器强制要求导入 `embed` 包——哪怕只嵌单个 `string` 也要（空导入即可；go1.27 实测报错原文：`go:embed requires import "embed"`）。
 
 b) 在 `// Handler 返回 admin mux...` 注释之前插入：
 
@@ -3116,10 +3116,10 @@ b) 在 `// Handler 返回 admin mux...` 注释之前插入：
 var staticIndexHTML string // 编译期打进二进制；单个嵌入模式允许直接嵌进 string
 ```
 
-c) `Handler()` 里三条 API 路由之前加一行：
+c) `Handler()` 里三条 API 路由之前加一行。注意结尾的 `{$}`——它让模式**精确匹配根路径**；裸 `GET /` 是子树模式，会把一切未注册 GET 路径吞进 handleIndex 返回 200，与 Task 5 已固化的 `TestHandlerMethodAndPathRouting`（GET /api/nope 必须 404）直接冲突。go1.22+ 语法，实测：`GET /` 200、`GET /api/dns` 200（更精确模式优先）、`GET /api/nope` 与其余未知 GET 404 不变。
 
 ```go
-	mux.HandleFunc("GET /", a.handleIndex)
+	mux.HandleFunc("GET /{$}", a.handleIndex)
 ```
 
 d) `handleConnections` 之前加方法：
