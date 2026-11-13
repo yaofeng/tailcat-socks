@@ -1,6 +1,5 @@
 .git
 run/
-go/bin/
-go/testdata/
-python/__pycache__/
-dns.txt
+src/bin/
+src/testdata/
+data/dns.txt

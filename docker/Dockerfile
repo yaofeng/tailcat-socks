@@ -9,9 +9,9 @@ ENV GOPROXY=https://goproxy.cn,direct \
     CGO_ENABLED=0
 RUN go install github.com/tailscale/tailcat/cmd/tailcat@latest
 
-WORKDIR /src
-COPY go/ /src/go/
-RUN cd /src/go && go build -trimpath -ldflags="-s -w" -o /out/tailcat-socks .
+WORKDIR /build
+COPY src/ ./src/
+RUN cd src && go build -trimpath -ldflags="-s -w" -o /out/tailcat-socks .
 
 # ---- runtime stage ----
 # Alpine, not debian-slim: both binaries are fully static (CGO off), so the
@@ -26,7 +26,7 @@ COPY --from=build /go/bin/tailcat /usr/local/bin/tailcat
 WORKDIR /app
 # dns.txt holds real tokens and is git-ignored; bake the example as a build
 # fallback (compose mounts your real dns.txt over it at runtime).
-COPY dns.txt.example /app/dns.txt
+COPY data/dns.txt.example /app/dns.txt
 
 ENV LISTEN=0.0.0.0:1080 \
     UPSTREAM=127.0.0.1:0 \

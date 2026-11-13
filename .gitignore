@@ -1,6 +1,3 @@
-__pycache__/
-*.pyc
 run/
-dns.txt
-go/bin/
-rust/target/
+data/dns.txt
+src/bin/

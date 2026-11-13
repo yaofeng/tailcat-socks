@@ -1,7 +1,6 @@
 // tailcat-socks: a SOCKS5 front proxy that rewrites real domain names to
 // tailcat tokens (tc...) and chains to a single standalone `tailcat socks`
-// upstream. This is a behavioral replica of the Python version
-// (python/tailcat_socks.py); see README.md for usage.
+// upstream. See README.md for usage.
 package main
 
 import (
@@ -23,7 +22,7 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)).With("component", "tailcat-socks"))
 	var (
 		listen       = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address (host:port; empty host binds all interfaces)")
-		dnsFile      = flag.String("dns-file", "dns.txt", "domain->token mapping file")
+		dnsFile      = flag.String("dns-file", "data/dns.txt", "domain->token mapping file")
 		upstream     = flag.String("upstream", "127.0.0.1:0", "upstream tailcat socks address (host:port; empty host binds all interfaces; port 0 = OS-assigned free port)")
 		tailcatBin   = flag.String("tailcat-bin", "tailcat", "path to tailcat binary (auto-launched)")
 		noAutolaunch = flag.Bool("no-autolaunch", false, "do not spawn tailcat socks; use an already-running upstream")

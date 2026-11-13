@@ -4,7 +4,7 @@
 
 你只需对一个固定的 SOCKS5 端口说人话域名,无需记 `tcXYZabc123...` 这种 token,也无需手动起 tailcat。
 
-本仓库包含行为一致的**三个实现**:`python/`(原版,纯标准库)、`go/`(零第三方依赖,单静态二进制)与 `rust/`(tokio 生态)。Docker 镜像基于 Go 版构建。
+本仓库为 **Go 实现**(`src/`,单静态二进制,仅依赖 fsnotify 做热加载)。Docker 镜像同样基于 Go 版构建。
 
 ## 它做什么
 
@@ -43,34 +43,25 @@ tcoAbCdEf789     www.example.com
 
 ## 安装依赖
 
-- Go 版:Go 1.23+(构建用;或直接用已构建的 `go/bin/tailcat-socks`)
-- Python 版:Python 3.8+(仅标准库)
-- Rust 版:Rust 1.85+(构建用;或直接用已构建的 `rust/target/release/tailcat-socks`)
+- Go 1.23+(构建用;或直接用已构建的 `src/bin/tailcat-socks`)
 - `tailcat`:https://github.com/tailscale/tailcat(`brew install tailcat` 或 `go install github.com/tailscale/tailcat/cmd/tailcat@latest`;注意 tailcat@latest 需要 Go 1.27+ 工具链)
 
 ## 快速开始(裸机)
 
 ```bash
 # 首次:从示例生成自己的映射文件,填入真实 token(此文件已被 git 忽略,勿提交)
-cp dns.txt.example dns.txt && $EDITOR dns.txt
+cp data/dns.txt.example data/dns.txt && $EDITOR data/dns.txt
 
-# 前台运行(默认: 监听 127.0.0.1:1080, dns.txt 在仓库根, tailcat socks 用随机高位端口)
+# 前台运行(默认: 监听 127.0.0.1:1080, dns.txt 在 data/, tailcat socks 用随机高位端口)
 
-# Go 版(推荐:先构建一次)
-cd go && go build -o bin/tailcat-socks . && cd ..
-go/bin/tailcat-socks
+# 先构建一次
+cd src && go build -o bin/tailcat-socks . && cd ..
+src/bin/tailcat-socks
 
-# Rust 版(推荐:先构建一次)
-cd rust && cargo build --release && cd ..
-rust/target/release/tailcat-socks
-
-# Python 版
-python3 python/tailcat_socks.py
-
-# 指定各参数(三版本参数同名同默认,下以 Go 版为例)
-go/bin/tailcat-socks \
+# 指定各参数
+src/bin/tailcat-socks \
     --listen 127.0.0.1:1080 \
-    --dns-file dns.txt \
+    --dns-file data/dns.txt \
     --upstream 127.0.0.1:1081 \
     --tailcat-bin tailcat
 
@@ -85,7 +76,7 @@ export all_proxy=socks5h://127.0.0.1:1080
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--listen` | `127.0.0.1:1080` | 面向客户端的 SOCKS5 监听地址 |
-| `--dns-file` | `dns.txt` | 域名→token 映射文件 |
+| `--dns-file` | `data/dns.txt` | 域名→token 映射文件 |
 | `--upstream` | `127.0.0.1:0` | 自动拉起的 `tailcat socks` 监听地址;端口 `0` = 随机高位端口 |
 | `--tailcat-bin` | `tailcat` | tailcat 可执行文件路径 |
 | `--no-autolaunch` | 关 | 不自动拉起,连一个已在运行的上游 SOCKS5 |
@@ -93,17 +84,13 @@ export all_proxy=socks5h://127.0.0.1:1080
 
 ## 启停脚本(bin/)
 
-后台运行,`run/` 下按版本维护 pid 与 log(`run/tailcat-socks-{go,python,rust}.{pid,log}`):
+后台运行,pid 与 log 在 `run/tailcat-socks-go.{pid,log}`:
 
 ```bash
-bin/start.sh          # 后台启动 Go 版(缺二进制时自动 go build)
-bin/start.sh python   # 后台启动 Python 版
-bin/start.sh rust     # 后台启动 Rust 版
-bin/stop.sh           # 停止(不带参数停全部版本;bin/stop.sh go 只停 Go 版)
-bin/stop.sh rust      # 只停 Rust 版
-bin/restart.sh        # 无参数 = 停全部 + 启 Go 版;bin/restart.sh python 重启 Python 版
-bin/restart.sh rust   # 重启 Rust 版
-tail -f run/tailcat-socks-go.log      # 或 ...-python.log / ...-rust.log
+bin/start.sh          # 后台启动(缺二进制时自动 go build)
+bin/stop.sh           # 停止
+bin/restart.sh        # 重启
+tail -f run/tailcat-socks-go.log
 ```
 
 脚本只停止确属本代理的进程(校验 /proc pid 归属);start 后若进程秒退(如 dns 文件不存在、端口被占)会直接报错并以非零码退出,并打印日志尾部。
@@ -120,43 +107,37 @@ docker compose logs -f
 docker compose down
 ```
 
-- compose 把仓库根目录只读挂进容器 `/app/config`,`DNS_FILE=/app/config/dns.txt`。改宿主机 `dns.txt` 即热加载(挂目录而非单文件,规避编辑器 rename 换 inode 导致的热加载失效)。
+- compose 把仓库根目录只读挂进容器 `/app/config`,`DNS_FILE=/app/config/data/dns.txt`。改宿主机 `data/dns.txt` 即热加载(挂目录而非单文件,规避编辑器 rename 换 inode 导致的热加载失效)。
 - 容器内 `LISTEN=0.0.0.0:1080`,tailcat socks 仍用内部随机高位端口。宿主机经 `1080:1080` 访问。
 - 容器需能出网(DERP/STUN)。
-- 镜像 runtime 为 `alpine:3.22`(全静态二进制不需要 glibc),内含 Go 静态编译的代理二进制与 tailcat,不再依赖 Python;已发布为 `yaofeng928/tailcat-socks:latest`。
+- 镜像 runtime 为 `alpine:3.22`(全静态二进制不需要 glibc),内含 Go 静态编译的代理二进制与 tailcat;已发布为 `yaofeng928/tailcat-socks:latest`。
 - 手动构建(等价于 compose):在仓库根目录 `docker build -f docker/Dockerfile -t tailcat-socks .`——context 必须是仓库根,不要写成 `-f docker/Dockerfile ..`(那会把父目录当 context)。
 
 ## dns.txt 热加载
 
-代理监听 `dns.txt` 变化即重新载入(原子替换内存映射):Go 版用 fsnotify 文件事件,Python/Rust 版每秒轮询 mtime。读取失败时保留旧映射并打警告。改完文件存盘即生效,无需重启;`--no-watch` 关闭。
+代理监听 `dns.txt` 变化即重新载入(原子替换内存映射):用 fsnotify 文件事件,并在每次 Create/Write 后重新挂载 watch(规避原子保存换 inode)。读取失败时保留旧映射并打警告。改完文件存盘即生效,无需重启;`--no-watch` 关闭。
 
 ## tailcat socks 端口
 
-默认 `--upstream` 端口为 `0`:Go 版由操作系统分配空闲端口,Python/Rust 版从 `20000–60999` 随机探测一个空闲高位端口给 tailcat socks。也可 `--upstream 127.0.0.1:1081` 固定。
+默认 `--upstream` 端口为 `0`:由操作系统分配空闲端口给 tailcat socks。也可 `--upstream 127.0.0.1:1081` 固定。
 
 ## 目录结构
 
 ```
 tailcat-socks/
-├── python/
-│   ├── tailcat_socks.py          # Python 版代理主体(纯标准库)
-│   └── tests/test_tailcat_socks.py
-├── go/                               # Go 版(idiomatic Go 重写;fsnotify 热加载)
+├── src/                              # Go 版(idiomatic Go;fsnotify 热加载)
 │   ├── main.go                       # flag / tailcat 自动拉起 / 信号
 │   ├── dnsmap.go                     # dns.txt 解析 + 原子热加载
 │   ├── proxy.go                      # SOCKS5 服务端 + 上游握手 + relay
 │   ├── *_test.go                     # go test 单元 + 端到端
 │   ├── testdata/fake-tailcat/        # 测试用假 tailcat
 │   └── bin/                          # 构建产物(gitignore)
-├── rust/                             # Rust 复刻版(tokio 生态)
-│   ├── Cargo.toml
-│   ├── src/{main,lib,config,dnsmap,proxy,tailcat,error,logging}.rs
-│   ├── src/bin/fake-tailcat.rs       # 测试用假 tailcat
-│   └── tests/{e2e,autolaunch,waitready_deadport}.rs
-├── bin/{start,stop,restart}.sh       # 裸机后台启停(支持 go|python|rust)
+├── bin/{start,stop,restart}.sh       # 裸机后台启停
 ├── docker/{Dockerfile,docker-compose.yml}
-├── docs/superpowers/                 # 设计文档与实现计划
-├── dns.txt                           # 域名→token 映射(运行时热加载)
+├── docs/superpowers/                 # 设计文档与实现计划(含已删除的 Python/Rust 版历史)
+├── data/
+│   ├── dns.txt                       # 域名→token 映射(运行时热加载,gitignore)
+│   └── dns.txt.example               # 示例映射
 └── run/                              # pid + log(脚本生成)
 ```
 
@@ -165,13 +146,9 @@ tailcat-socks/
 - **支持**: SOCKS5 `CONNECT`;IPv4/IPv6/域名 ATYP;无认证握手;未命中域名透传;多线程并发;tailcat 子进程自动拉起/回收;dns.txt 热加载。
 - **不支持**(YAGNI): `UDP ASSOCIATE` / `BIND`(返回失败);用户名/密码认证;跨进程共享映射。
 
-三个实现行为一致;Docker 镜像仍基于 Go 版构建。
-
 ## 测试
 
 ```bash
-cd go && go test ./...              # Go 版:解析/改写/热加载/端到端
-python3 -m pytest python/tests -v   # Python 版
-cd rust && cargo test               # Rust 版:解析/改写/热加载/端到端
+cd src && go test ./...             # 解析/改写/热加载/端到端
 ```
 覆盖 dns.txt 解析、大小写改写、未命中透传、热加载、空闲超时,以及经假上游/假 tailcat 的端到端 host 改写。

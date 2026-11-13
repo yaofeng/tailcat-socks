@@ -1,7 +1,7 @@
 services:
   tailcat-socks:
     build:
-      context: ..                       # repo root so COPY go/ + dns.txt.example resolve
+      context: ..                       # repo root so COPY src/ + data/dns.txt.example resolve
       dockerfile: docker/Dockerfile
     image: yaofeng928/tailcat-socks:latest
     container_name: tailcat-socks
@@ -15,7 +15,7 @@ services:
     environment:
       LISTEN: "0.0.0.0:1080"            # bind all ifaces inside the container
       UPSTREAM: "127.0.0.1:0"           # tailcat socks -> random high port (internal)
-      DNS_FILE: "/app/config/dns.txt"   # live-mounted, hot-reloaded
+      DNS_FILE: "/app/config/data/dns.txt"  # live-mounted, hot-reloaded
       TAILCAT_BIN: "tailcat"
     restart: unless-stopped
     # tailcat needs to reach DERP/STUN over the network; give it outbound access.
