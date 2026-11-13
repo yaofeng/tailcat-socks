@@ -3197,7 +3197,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **Files:**
 - Rewrite: `docker/Dockerfile`、`docker/docker-compose.yml`、`README.md`
-- Modify: `bin/start.sh`、`.dockerignore`
+- Modify: `bin/start.sh`、`.dockerignore`、`.gitignore`
 
 - [ ] **Step 8.1 整体替换 `docker/Dockerfile`**：
 
@@ -3307,13 +3307,21 @@ c) `ARGS=(...)` 行替换为（admin/key 不再透传——二进制自己按 fl
 ARGS=(--listen "$LISTEN" --dns-file "$DNS_FILE")
 ```
 
-- [ ] **Step 8.4 修改 `.dockerignore`**：删除 `src/testdata/` 一行（目录已不存在），结果：
+- [ ] **Step 8.4 修改 `.dockerignore` 与 `.gitignore`**：
+
+a) `.dockerignore` 删除 `src/testdata/` 一行（目录已不存在），结果：
 
 ```
 .git
 run/
 bin/
 data/dns.txt
+```
+
+b) `.gitignore` 追加一行 `src/tailcat-socks`（`go build ./...` 在 src/ 里留下的构建残留；本计划多个步骤会跑它，防误提交）：
+
+```bash
+echo "src/tailcat-socks" >> .gitignore
 ```
 
 - [ ] **Step 8.5 整体替换 `README.md`**（注意：README 自身含多个 3-backtick 代码块，故本步骤外层用 4-backtick 围栏；落地时把围栏内内容原样写入文件）：
@@ -3496,7 +3504,7 @@ cd src && go test ./...             # 全离线:本地回环 + 注入 fake,无�
 
   ```bash
   cd /data/yaofeng/workspace/popeye/tailcat-socks
-  git add docker/ bin/start.sh .dockerignore README.md
+  git add docker/ bin/start.sh .dockerignore .gitignore README.md
   git commit -m "deploy+docs: single static binary; admin addr; key volume
 
 Dockerfile drops the tailcat install layer and child-binary COPY (the
