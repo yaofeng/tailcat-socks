@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -19,10 +20,14 @@ func NewAdmin(registry *ConnRegistry, dnsMap *DNSMap, dnsPath string) *Admin {
 	return &Admin{registry: registry, dnsMap: dnsMap, dnsPath: dnsPath}
 }
 
+//go:embed static/index.html
+var staticIndexHTML string // 编译期打进二进制；单个嵌入模式允许直接嵌进 string
+
 // Handler 返回 admin mux，用 Go 1.22 的方法+路径模式：未注册路径 404，
 // 同路径异方法由 mux 直接给 405。
 func (a *Admin) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", a.handleIndex)
 	mux.HandleFunc("GET /api/connections", a.handleConnections)
 	mux.HandleFunc("GET /api/dns", a.handleGetDNS)
 	mux.HandleFunc("PUT /api/dns", a.handlePutDNS)
@@ -60,6 +65,12 @@ type connJSON struct {
 type connectionsDoc struct {
 	Active []connJSON `json:"active"`
 	Totals Totals     `json:"totals"`
+}
+
+func (a *Admin) handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// go:embed 在编译期保证内容存在；写失败只可能是客户端已断开。
+	_, _ = w.Write([]byte(staticIndexHTML))
 }
 
 func (a *Admin) handleConnections(w http.ResponseWriter, r *http.Request) {

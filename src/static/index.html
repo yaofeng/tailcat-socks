@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tailcat-socks 管理</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #12141a; color: #d8dce6; font: 14px/1.5 system-ui, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid #262a33; }
+header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+.tabs { display: flex; gap: 4px; }
+.tabs button { background: none; border: 0; color: #8b93a5; padding: 8px 14px; font-size: 14px; cursor: pointer; border-bottom: 2px solid transparent; }
+.tabs button.active { color: #e6edf3; border-bottom-color: #3d7efd; }
+main { padding: 16px 20px; max-width: 1200px; }
+.cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.card { background: #1a1d24; border: 1px solid #262a33; border-radius: 8px; padding: 10px 16px; min-width: 150px; }
+.card .k { color: #8b93a5; font-size: 12px; }
+.card .v { font-size: 20px; font-weight: 600; margin-top: 2px; }
+table { width: 100%; border-collapse: collapse; background: #1a1d24; border: 1px solid #262a33; border-radius: 8px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #23262e; white-space: nowrap; }
+th { color: #8b93a5; font-weight: 500; font-size: 12px; background: #171a20; }
+tr:last-child td { border-bottom: 0; }
+.badge { padding: 1px 8px; border-radius: 999px; font-size: 12px; }
+.badge.tunnel { background: #1d3a63; color: #9cc3ff; }
+.badge.direct { background: #274a2c; color: #9fe0a8; }
+.badge.handshake { background: #4a3d1f; color: #e6c979; }
+.badge.open { background: #274a2c; color: #9fe0a8; }
+.muted { color: #6b7280; }
+button.act { background: #262a33; color: #d8dce6; border: 1px solid #343a46; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+button.act:hover { background: #2f3440; }
+button.primary { background: #2c5fba; border-color: #2c5fba; }
+button.primary:hover { background: #3d7efd; }
+input.txt { background: #12141a; color: #d8dce6; border: 1px solid #343a46; border-radius: 6px; padding: 6px 8px; width: 100%; }
+#status { margin-left: auto; font-size: 12px; color: #8b93a5; }
+#status.err { color: #ff7b72; }
+.msg { margin: 10px 0; font-size: 13px; }
+.msg.err { color: #ff7b72; }
+.msg.ok { color: #7ee787; }
+.bar { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tailcat-socks</h1>
+  <nav class="tabs">
+    <button id="tab-conn" class="active">当前连接</button>
+    <button id="tab-dns">DNS 配置</button>
+  </nav>
+  <span id="status">加载中…</span>
+</header>
+<main>
+  <section id="view-conn">
+    <div class="cards">
+      <div class="card"><div class="k">活跃连接</div><div class="v" id="sum-active">–</div></div>
+      <div class="card"><div class="k">累计会话</div><div class="v" id="sum-total">–</div></div>
+      <div class="card"><div class="k">上行合计</div><div class="v" id="sum-up">–</div></div>
+      <div class="card"><div class="k">下行合计</div><div class="v" id="sum-down">–</div></div>
+      <div class="card"><div class="k">聚合速率 ↑ / ↓</div><div class="v" id="sum-rate" style="font-size:15px">– / –</div></div>
+    </div>
+    <table>
+      <thead><tr>
+        <th>#</th><th>域名</th><th>目标</th><th>端口</th><th>通道</th><th>状态</th>
+        <th>客户端</th><th>时长</th><th>↑ 上/下</th><th>↑ 速率</th><th>↓ 字节</th><th>↓ 速率</th>
+      </tr></thead>
+      <tbody id="conn-body"><tr><td colspan="12" class="muted">加载中…</td></tr></tbody>
+    </table>
+  </section>
+  <section id="view-dns" hidden>
+    <p class="muted" id="dns-path"></p>
+    <table>
+      <thead><tr>
+        <th style="width:260px">token</th><th>domains（逗号或空格分隔）</th>
+        <th style="width:220px">备注</th><th style="width:76px"></th>
+      </tr></thead>
+      <tbody id="dns-body"></tbody>
+    </table>
+    <div class="bar">
+      <button class="act" id="dns-add">＋ 新增条目</button>
+      <button class="act primary" id="dns-save">保存并生效</button>
+    </div>
+    <div id="dns-msg" class="msg"></div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (ch) =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"})[ch]);
+const fmtBytes = (n) => {
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB", "TB"];
+  let i = -1, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 ? 0 : 1) + " " + u[i];
+};
+const fmtRate = (bps) => fmtBytes(Math.max(0, bps)) + "/s"; // clamp: id 复用/重启后差值可能为负
+const fmtDur = (ms) => {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m" + (s % 60) + "s";
+  return Math.floor(s / 3600) + "h" + Math.floor((s % 3600) / 60) + "m";
+};
+
+// ---- Tab 切换 ----
+function showTab(name) {
+  $("tab-conn").classList.toggle("active", name === "tab-conn");
+  $("tab-dns").classList.toggle("active", name === "tab-dns");
+  $("view-conn").hidden = name !== "tab-conn";
+  $("view-dns").hidden = name !== "tab-dns";
+}
+$("tab-conn").onclick = () => showTab("tab-conn");
+$("tab-dns").onclick = () => { showTab("tab-dns"); loadDns(); };
+
+// ---- 当前连接：1s 轮询，速率 = 相邻两次采样差（spec §6） ----
+let prev = new Map();     // id -> {t, up, down}
+let prevObs = null;       // {t, up, down} — 上轮观测累计快照
+let obsUp = 0, obsDown = 0; // 观测累计字节：只增不减（页面级统计，刷新归零）
+
+async function pollConn() {
+  let doc;
+  try {
+    const r = await fetch("/api/connections", {cache: "no-store"});
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    doc = await r.json();
+  } catch (e) {
+    $("status").textContent = "管理 API 失联: " + e.message;
+    $("status").className = "err";
+    return;
+  }
+  $("status").textContent = "更新于 " + new Date().toLocaleTimeString();
+  $("status").className = "";
+  const now = Date.now();
+
+  const cur = new Map();
+  const rows = doc.active.map((c) => {
+    const p = prev.get(c.id);
+    let ur = "–", dr = "–";
+    if (p && now > p.t) {
+      const dt = (now - p.t) / 1000;
+      const du = Math.max(0, c.bytesUp - p.up);
+      const dd = Math.max(0, c.bytesDown - p.down);
+      obsUp += du;
+      obsDown += dd;
+      ur = fmtRate(du / dt);
+      dr = fmtRate(dd / dt);
+    }
+    cur.set(c.id, {t: now, up: c.bytesUp, down: c.bytesDown});
+    const stateBadge = c.state === "open"
+      ? '<span class="badge open">open</span>'
+      : '<span class="badge handshake">handshake</span>';
+    return "<tr><td>" + c.id +
+      "</td><td>" + esc(c.host) +
+      "</td><td class=\"muted\">" + esc(c.target) +
+      "</td><td>" + c.port +
+      "</td><td><span class=\"badge " + esc(c.via) + "\">" + esc(c.via) + "</span>" +
+      "</td><td>" + stateBadge +
+      "</td><td class=\"muted\">" + esc(c.client) +
+      "</td><td>" + fmtDur(now - c.startedAt) +
+      "</td><td>" + fmtBytes(c.bytesUp) +
+      "</td><td>" + ur +
+      "</td><td>" + fmtBytes(c.bytesDown) +
+      "</td><td>" + dr + "</td></tr>";
+  });
+  prev = cur;
+  $("conn-body").innerHTML = rows.length
+    ? rows.join("")
+    : '<tr><td colspan="12" class="muted">暂无活跃连接</td></tr>';
+
+  const t = doc.totals;
+  $("sum-active").textContent = t.active;
+  $("sum-total").textContent = t.sessionsTotal;
+  $("sum-up").textContent = fmtBytes(t.bytesUp);
+  $("sum-down").textContent = fmtBytes(t.bytesDown);
+  // 聚合速率不能拿 totals.bytesUp/Down 做差分：那是"当前活跃会话之和"，
+  // 任何连接在两轮轮询之间关闭都会让其累计字节离开求和，差分转负、被 clamp
+  // 成 0 B/s——真实流量被抹零。改用观测累计字节（每轮把各行正增量累加进
+  // obsUp/obsDown，只增不减）做差分：连接关闭只丢"末轮轮询到关闭之间"不足
+  // 一个轮询周期的尾差，好过整体归零。上方合计卡片仍显示服务器口径的活跃
+  // 字节和（spec §8），不受此影响。
+  if (prevObs && now > prevObs.t) {
+    const dt = (now - prevObs.t) / 1000;
+    $("sum-rate").textContent =
+      fmtRate((obsUp - prevObs.up) / dt) + " / " + fmtRate((obsDown - prevObs.down) / dt);
+  }
+  prevObs = {t: now, up: obsUp, down: obsDown};
+}
+
+// ---- DNS 配置 ----
+function dnsMsg(text, isErr) {
+  const m = $("dns-msg");
+  m.textContent = text;
+  m.className = "msg " + (isErr ? "err" : "ok");
+}
+
+async function loadDns() {
+  try {
+    const r = await fetch("/api/dns", {cache: "no-store"});
+    const doc = await r.json().catch(() => ({}));
+    if (!r.ok) { dnsMsg("读取失败: " + (doc.error || ("HTTP " + r.status)), true); return; }
+    $("dns-path").textContent = "文件: " + doc.path;
+    $("dns-body").innerHTML = "";
+    // 空文件/纯注释文件的 entries 在 Go 端是 nil slice → JSON 里是 null；
+    // || [] 兜底，与 active 的"永不为 null"防御同理（见 admin_test 注释）。
+    for (const e of (doc.entries || [])) addDnsRow(e.token, (e.domains || []).join(", "), e.note);
+    dnsMsg("");
+  } catch (e) {
+    dnsMsg("读取失败: " + e.message, true);
+  }
+}
+
+function addDnsRow(token, domains, note) {
+  const tr = document.createElement("tr");
+  tr.innerHTML =
+    '<td><input class="txt" data-f="token" value="' + esc(token) + '" placeholder="tc..."></td>' +
+    '<td><input class="txt" data-f="domains" value="' + esc(domains) + '" placeholder="a.example.com, b.example.com"></td>' +
+    '<td><input class="txt" data-f="note" value="' + esc(note) + '" placeholder="备注"></td>' +
+    '<td><button class="act" data-act="del">删除</button></td>';
+  tr.querySelector('[data-act="del"]').onclick = () => tr.remove();
+  $("dns-body").appendChild(tr);
+}
+
+function collectDns() {
+  const out = [];
+  for (const tr of $("dns-body").children) {
+    const token = tr.querySelector('[data-f="token"]').value.trim();
+    const domains = tr.querySelector('[data-f="domains"]').value.split(/[\s,]+/).filter(Boolean);
+    const note = tr.querySelector('[data-f="note"]').value.trim();
+    if (!token && !domains.length && !note) continue; // 全空行静默忽略
+    out.push({token: token, domains: domains, note: note});
+  }
+  return out;
+}
+
+async function saveDns() {
+  const entries = collectDns();
+  // 空保存合法但是核按钮（spec §7 文件由 UI 托管：全部映射与散注释即刻消失），必须确认。
+  if (entries.length === 0 && !confirm("将清空全部 DNS 映射并落盘，确认保存？")) return;
+  try {
+    const r = await fetch("/api/dns", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(entries),
+    });
+    const doc = await r.json().catch(() => ({}));
+    if (!r.ok) { dnsMsg("保存失败: " + (doc.error || ("HTTP " + r.status)), true); return; }
+    dnsMsg("已保存并生效（" + doc.domains + " 域名 / " + doc.tokens + " token）", false);
+    loadDns(); // 拉回落盘后的真身：last-writer-wins（spec §7）
+  } catch (e) {
+    dnsMsg("保存失败: " + e.message, true);
+  }
+}
+
+$("dns-add").onclick = () => addDnsRow("", "", "");
+$("dns-save").onclick = saveDns;
+
+setInterval(pollConn, 1000);
+pollConn();
+</script>
+</body>
+</html>

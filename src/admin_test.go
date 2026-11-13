@@ -277,3 +277,21 @@ func TestHandlePutDNSBodyTooLarge(t *testing.T) {
 		t.Errorf("dnsMap changed despite 400: %d domains, want 3", got)
 	}
 }
+
+func TestHandleIndexServesEmbeddedPage(t *testing.T) {
+	admin, _, _, _ := newAdminFixture(t)
+	rec := httptest.NewRecorder()
+	admin.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET / = %d, body = %s", rec.Code, rec.Body)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html...", ct)
+	}
+	body := rec.Body.String()
+	for _, marker := range []string{"当前连接", "DNS 配置", "/api/connections", "/api/dns", "备注"} {
+		if !strings.Contains(body, marker) {
+			t.Errorf("page missing %q", marker)
+		}
+	}
+}
