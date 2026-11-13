@@ -1,5 +1,5 @@
 .git
 run/
-src/bin/
+bin/
 src/testdata/
 data/dns.txt

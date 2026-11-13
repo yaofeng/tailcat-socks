@@ -10,7 +10,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="$ROOT/run"
 
-BIN="$ROOT/src/bin/tailcat-socks"
+BIN="$ROOT/bin/tailcat-socks"
 PID_FILE="$RUN_DIR/tailcat-socks-go.pid"
 LOG_FILE="$RUN_DIR/tailcat-socks-go.log"
 
@@ -45,7 +45,7 @@ fi
 # Build the proxy if the binary is missing (requires the Go toolchain).
 if [[ ! -x "$BIN" ]]; then
   echo "go binary missing; building (go build)..."
-  (cd "$ROOT/src" && go build -o bin/tailcat-socks .)
+  (cd "$ROOT/src" && go build -o "$ROOT/bin/tailcat-socks" .)
 fi
 
 : > "$LOG_FILE"   # truncate on each fresh start

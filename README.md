@@ -43,7 +43,7 @@ tcoAbCdEf789     www.example.com
 
 ## 安装依赖
 
-- Go 1.23+(构建用;或直接用已构建的 `src/bin/tailcat-socks`)
+- Go 1.23+(构建用;或直接用已构建的 `bin/tailcat-socks`)
 - `tailcat`:https://github.com/tailscale/tailcat(`brew install tailcat` 或 `go install github.com/tailscale/tailcat/cmd/tailcat@latest`;注意 tailcat@latest 需要 Go 1.27+ 工具链)
 
 ## 快速开始(裸机)
@@ -55,11 +55,11 @@ cp data/dns.txt.example data/dns.txt && $EDITOR data/dns.txt
 # 前台运行(默认: 监听 127.0.0.1:1080, dns.txt 在 data/, tailcat socks 用随机高位端口)
 
 # 先构建一次
-cd src && go build -o bin/tailcat-socks . && cd ..
-src/bin/tailcat-socks
+(cd src && go build -o ../bin/tailcat-socks .)
+bin/tailcat-socks
 
 # 指定各参数
-src/bin/tailcat-socks \
+bin/tailcat-socks \
     --listen 127.0.0.1:1080 \
     --dns-file data/dns.txt \
     --upstream 127.0.0.1:1081 \
@@ -130,9 +130,8 @@ tailcat-socks/
 │   ├── dnsmap.go                     # dns.txt 解析 + 原子热加载
 │   ├── proxy.go                      # SOCKS5 服务端 + 上游握手 + relay
 │   ├── *_test.go                     # go test 单元 + 端到端
-│   ├── testdata/fake-tailcat/        # 测试用假 tailcat
-│   └── bin/                          # 构建产物(gitignore)
-├── bin/{start,stop,restart}.sh       # 裸机后台启停
+│   └── testdata/fake-tailcat/        # 测试用假 tailcat
+├── bin/                              # 启停脚本 {start,stop,restart}.sh + 构建产物 tailcat-socks(gitignore)
 ├── docker/{Dockerfile,docker-compose.yml}
 ├── docs/superpowers/                 # 设计文档与实现计划(含已删除的 Python/Rust 版历史)
 ├── data/
