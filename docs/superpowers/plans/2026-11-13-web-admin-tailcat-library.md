@@ -2621,13 +2621,20 @@ func TestHandlePutDNSBodyTooLarge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// ~2.3 MB，超过 1 MiB 上限；条目本身合法——MaxBytesReader 在 Decode 读到
-	// 上限时即触发，与内容合法性无关。
+	// ~2.3 MB，超过 1 MiB 上限：MaxBytesReader 在 Decode 流读到上限时报错。
+	// 断言要求错误串直指上限——若日后删掉 cap 行，本测试必须失败（届时
+	// 400 只会来自末尾 `},]` 的语法错误），而不是搭上空转的便车。
 	body := "[" + strings.Repeat(`{"token":"tcAAA111","domains":["a.example.com"],"note":""},`, 40000) + "]"
 	rec := httptest.NewRecorder()
 	admin.Handler().ServeHTTP(rec, httptest.NewRequest("PUT", "/api/dns", strings.NewReader(body)))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (1 MiB body cap)", rec.Code)
+	}
+	var e struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil || !strings.Contains(e.Error, "request body too large") {
+		t.Fatalf("body = %s, want error citing request body too large", rec.Body)
 	}
 	after, err := os.ReadFile(path)
 	if err != nil {
