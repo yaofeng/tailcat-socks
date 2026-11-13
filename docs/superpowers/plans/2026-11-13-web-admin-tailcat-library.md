@@ -3342,11 +3342,11 @@ func resolveSetting(explicit bool, envName, flagVal string) string {
   ```bash
   cd /data/yaofeng/workspace/popeye/tailcat-socks
   GOPROXY=https://goproxy.cn,direct go build -o bin/tailcat-socks ./src
-  ./bin/tailcat-socks --dns-file data/dns.txt.example --client-key-file /data/yaofeng/tmp/tc-smoke-key --admin-addr 127.0.0.1:18080 &
+  ./bin/tailcat-socks --listen 127.0.0.1:11080 --dns-file data/dns.txt.example --client-key-file /data/yaofeng/tmp/tc-smoke-key --admin-addr 127.0.0.1:18080 &
   sleep 1
   curl -fsS http://127.0.0.1:18080/api/connections | head -c 400; echo
   curl -fsS http://127.0.0.1:18080/ -o /dev/null -w 'index %{http_code}\n'
-  ADMIN_ADDR=127.0.0.1:18081 ./bin/tailcat-socks --dns-file data/dns.txt.example --client-key-file /data/yaofeng/tmp/tc-smoke-key2 &
+  ADMIN_ADDR=127.0.0.1:18081 ./bin/tailcat-socks --listen 127.0.0.1:11081 --dns-file data/dns.txt.example --client-key-file /data/yaofeng/tmp/tc-smoke-key2 &
   sleep 1
   curl -fsS http://127.0.0.1:18081/api/dns -o /dev/null -w 'env %{http_code}\n'
   kill %1 %2
