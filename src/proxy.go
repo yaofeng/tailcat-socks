@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -383,48 +384,67 @@ func relay(client, upstream net.Conn, idle time.Duration) {
 type idleConn struct {
 	net.Conn
 	onActivity func()
+	// count 非 nil 时，每个成功 Read 的字节数累加进去——管理页的每会话
+	// 流量计数就挂在这里（方向天然正确：读客户端腿=上行、读目标腿=下行）。
+	count *atomic.Uint64
 }
 
 func (c *idleConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
 		c.onActivity()
+		if c.count != nil {
+			c.count.Add(uint64(n))
+		}
 	}
 	return n, err
 }
 
-// tcpOf returns the *net.TCPConn behind conn, unwrapping an idleConn
-// wrapper first; it returns nil for any non-TCP conn.
-func tcpOf(conn net.Conn) *net.TCPConn {
+// halfOf 取出连接背后的原始 conn（拆掉 relay 的 idleConn 包装一层）。
+func halfOf(conn net.Conn) net.Conn {
 	if c, ok := conn.(*idleConn); ok {
-		conn = c.Conn
+		return c.Conn
 	}
-	tc, _ := conn.(*net.TCPConn)
+	return conn
+}
+
+// tcpOf 返回 conn 背后的 *net.TCPConn；其余连接类型返回 nil。库化后
+// tailcat 交回的是 netstack 虚拟连接，不是 *net.TCPConn，nil 是常态。
+func tcpOf(conn net.Conn) *net.TCPConn {
+	tc, _ := halfOf(conn).(*net.TCPConn)
 	return tc
 }
 
-// closeWrite sends FIN on the TCP connection, whether wrapped or raw.
+// closeWrite 发送 FIN：真 TCP 走 CloseWrite；虚拟连接按接口探测
+// （tailscale netstack 的 conn 提供同签名的 CloseWrite/CloseRead）。
+// 两者都没有则不是错误——随后的 Close 会兜底。
 func closeWrite(conn net.Conn) {
 	if tc := tcpOf(conn); tc != nil {
 		tc.CloseWrite()
+		return
+	}
+	if cw, ok := halfOf(conn).(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
 	}
 }
 
-// halfClose is the Go equivalent of shutdown(fd, SHUT_RDWR). The anti-RST
-// property comes from CloseWrite: once FIN is queued, tcp_close no longer
-// treats queued unread data as "the peer still wants it", so Close ends in
-// FIN instead of RST. (CloseRead alone does not give that guarantee; this was
-// verified empirically.) CloseRead mirrors Python's shutdown(SHUT_RD) — it
-// drops further input, at the same cost Python pays: data the peer sends in
-// the window before Close earns the peer an RST. Errors are ignored on
-// purpose, like Python's `except OSError: pass` around the shutdowns. Non-TCP
-// conns have no such half-close; leave them for Close. tcpOf unwraps the
-// relay's idleConn, so halfClose works on wrapped or raw conns alike.
+// halfClose 是 Go 版的 shutdown(fd, SHUT_RDWR)。anti-RST 性质来自
+// CloseWrite：FIN 入队后 tcp_close 不再把未读的排队数据当作"对端还要"，
+// 于是 Close 发 FIN 而不是 RST。（单独 CloseRead 给不了这个保证,
+// 已实测。）CloseRead 对应 Python 的 shutdown(SHUT_RD)——丢弃后续输入,
+// 代价与 Python 相同。错误一律忽略，同 Python 的 except OSError: pass。
+// 真 TCP 走方法对；虚拟连接走接口回退；都不支持的留给 Close。
 func halfClose(conn net.Conn) {
-	tc := tcpOf(conn)
-	if tc == nil {
+	c := halfOf(conn)
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.CloseWrite() // FIN to the peer, like shutdown(SHUT_WR)
+		tc.CloseRead()  // stop caring about further input, like shutdown(SHUT_RD)
 		return
 	}
-	tc.CloseWrite() // FIN to the peer, like shutdown(SHUT_WR)
-	tc.CloseRead()  // stop caring about further input, like shutdown(SHUT_RD)
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+	if cr, ok := c.(interface{ CloseRead() error }); ok {
+		_ = cr.CloseRead()
+	}
 }
