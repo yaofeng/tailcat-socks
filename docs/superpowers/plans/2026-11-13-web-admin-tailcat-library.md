@@ -1982,7 +1982,7 @@ func (s *Server) serveConn(client net.Conn) {
 
 	// Handshake over; relay's idle timer governs both legs from here.
 	client.SetDeadline(time.Time{})
-	up.SetDeadline(time.Time{})         // the Dialer hands back deadline-free conns; kept for clarity
+	up.SetDeadline(time.Time{})          // the Dialer hands back deadline-free conns; kept for clarity
 	relay(client, up, s.relayIdle, sess) // relay owns both conns and closes them
 }
 
@@ -2142,10 +2142,10 @@ func closeWrite(conn net.Conn) {
 
 // halfClose 是 Go 版的 shutdown(fd, SHUT_RDWR)。anti-RST 性质来自
 // CloseWrite：FIN 入队后 tcp_close 不再把未读的排队数据当作"对端还要"，
-// 于是 Close 发 FIN 而不是 RST。（单独 CloseRead 给不了这个保证，已实测。）
-// CloseRead 对应 Python 的 shutdown(SHUT_RD)——丢弃后续输入，代价与 Python
-// 相同。错误一律忽略，同 Python 的 except OSError: pass。真 TCP 走方法对；
-// 虚拟连接走接口回退；都不支持的留给 Close。
+// 于是 Close 发 FIN 而不是 RST。（单独 CloseRead 给不了这个保证,
+// 已实测。）CloseRead 对应 Python 的 shutdown(SHUT_RD)——丢弃后续输入,
+// 代价与 Python 相同。错误一律忽略，同 Python 的 except OSError: pass。
+// 真 TCP 走方法对；虚拟连接走接口回退；都不支持的留给 Close。
 func halfClose(conn net.Conn) {
 	c := halfOf(conn)
 	if tc, ok := c.(*net.TCPConn); ok {
@@ -2284,7 +2284,7 @@ func run(listen, dnsFile, clientKeyFile string, noWatch bool) int {
   ```go
   	// Opened 只许经 ConnRegistry.MarkOpen 写：与 Snapshot 的读同受 registry
   	// 锁保护，禁止任何直接赋值（会竞态 Snapshot）。
-  	Opened bool
+  	Opened  bool
   ```
 
   b) `src/stats_test.go` 末尾追加（import 若无 `"sync"` 则补上）：
