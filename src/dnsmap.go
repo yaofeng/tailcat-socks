@@ -161,7 +161,11 @@ func LoadDNSEntries(path string) ([]Entry, error) {
 		case line == "":
 			note = nil
 		case strings.HasPrefix(line, "#"):
-			note = append(note, strings.TrimSpace(strings.TrimLeft(line, "#")))
+			// 空注释体（"#"/"#   "）跳过：append 空串会让 join 后带上前导
+			// 空格，破坏 round-trip。
+			if body := strings.TrimSpace(strings.TrimLeft(line, "#")); body != "" {
+				note = append(note, body)
+			}
 		default:
 			fields := strings.Fields(line)
 			entries = append(entries, Entry{
@@ -200,6 +204,9 @@ func ValidateEntries(entries []Entry) error {
 		}
 		if strings.HasPrefix(e.Token, "#") {
 			return fmt.Errorf("条目%d: token 不能以 # 开头", n)
+		}
+		if strings.ContainsAny(e.Token, " \t\r\n") {
+			return fmt.Errorf("条目%d: 包含空白", n)
 		}
 		if !strings.HasPrefix(e.Token, "tc") {
 			slog.Warn("token lacks the tc prefix (tailcat addresses normally start with it)", "entry", n, "token", e.Token)

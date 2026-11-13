@@ -209,6 +209,7 @@ func TestValidateEntries(t *testing.T) {
 	bad := [][]Entry{
 		{{Token: "", Domains: []string{"a.com"}}},
 		{{Token: "#x", Domains: []string{"a.com"}}},
+		{{Token: "a b", Domains: []string{"x.com"}}},
 		{{Token: "tcA", Domains: nil}},
 		{{Token: "tcA", Domains: []string{"a#b"}}},
 		{{Token: "tcA", Domains: []string{"a b"}}},
@@ -220,6 +221,17 @@ func TestValidateEntries(t *testing.T) {
 		} else if !strings.HasPrefix(err.Error(), "条目1") {
 			t.Errorf("bad case %d: message %q should name the entry", i, err)
 		}
+	}
+}
+
+func TestLoadDNSEntriesSkipsEmptyCommentBodies(t *testing.T) {
+	path := writeTemp(t, "# a\n#\n#  \n# b\ntcA a.com\n")
+	entries, err := LoadDNSEntries(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Note != "a b" {
+		t.Fatalf("empty comment bodies leaked into note: %+v", entries)
 	}
 }
 
