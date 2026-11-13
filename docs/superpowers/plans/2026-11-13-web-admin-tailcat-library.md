@@ -2416,7 +2416,10 @@ type connItem struct {
 	BytesDown uint64 `json:"bytesDown"`
 }
 
-type connectionsDoc struct {
+// clientConnectionsDoc is the test-side decode mirror of the spec §8
+// document. It is named apart from admin.go's connectionsDoc because both
+// files are package main and two package-scope types cannot share a name.
+type clientConnectionsDoc struct {
 	Active []connItem `json:"active"`
 	Totals Totals     `json:"totals"`
 }
@@ -2438,7 +2441,7 @@ func TestHandleConnectionsShapeAndCounts(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
 		t.Errorf("Content-Type = %q", ct)
 	}
-	var doc connectionsDoc
+	var doc clientConnectionsDoc
 	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
 		t.Fatalf("decode: %v\nbody: %s", err, rec.Body)
 	}
