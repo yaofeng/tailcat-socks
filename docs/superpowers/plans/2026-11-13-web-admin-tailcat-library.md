@@ -2065,12 +2065,21 @@ func relay(client, upstream net.Conn, idle time.Duration, sess *Session) {
 		defer wg.Done()
 		if _, err := io.Copy(wrappedUpstream, wrappedClient); err == nil {
 			closeWrite(wrappedUpstream)
+		} else {
+			// Hard abort (RST/timeout), not a clean EOF: the failed peer
+			// can never send again, so the session is over as a whole.
+			// Blocking in wg.Wait for the other direction would pin both
+			// legs until the idle timer — and keep the client's FIN from
+			// ever arriving.
+			once.Do(stop)
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		if _, err := io.Copy(wrappedClient, wrappedUpstream); err == nil {
 			closeWrite(wrappedClient)
+		} else {
+			once.Do(stop)
 		}
 	}()
 	wg.Wait()
