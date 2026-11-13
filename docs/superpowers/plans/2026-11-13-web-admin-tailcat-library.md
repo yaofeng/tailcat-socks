@@ -2973,7 +2973,8 @@ $("tab-dns").onclick = () => { showTab("tab-dns"); loadDns(); };
 
 // ---- 当前连接：1s 轮询，速率 = 相邻两次采样差（spec §6） ----
 let prev = new Map();     // id -> {t, up, down}
-let prevTot = null;       // {t, up, down}
+let prevObs = null;       // {t, up, down} — 上轮观测累计快照
+let obsUp = 0, obsDown = 0; // 观测累计字节：只增不减（页面级统计，刷新归零）
 
 async function pollConn() {
   let doc;
@@ -2996,8 +2997,12 @@ async function pollConn() {
     let ur = "–", dr = "–";
     if (p && now > p.t) {
       const dt = (now - p.t) / 1000;
-      ur = fmtRate((c.bytesUp - p.up) / dt);
-      dr = fmtRate((c.bytesDown - p.down) / dt);
+      const du = Math.max(0, c.bytesUp - p.up);
+      const dd = Math.max(0, c.bytesDown - p.down);
+      obsUp += du;
+      obsDown += dd;
+      ur = fmtRate(du / dt);
+      dr = fmtRate(dd / dt);
     }
     cur.set(c.id, {t: now, up: c.bytesUp, down: c.bytesDown});
     const stateBadge = c.state === "open"
@@ -3026,12 +3031,18 @@ async function pollConn() {
   $("sum-total").textContent = t.sessionsTotal;
   $("sum-up").textContent = fmtBytes(t.bytesUp);
   $("sum-down").textContent = fmtBytes(t.bytesDown);
-  if (prevTot && now > prevTot.t) {
-    const dt = (now - prevTot.t) / 1000;
+  // 聚合速率不能拿 totals.bytesUp/Down 做差分：那是"当前活跃会话之和"，
+  // 任何连接在两轮轮询之间关闭都会让其累计字节离开求和，差分转负、被 clamp
+  // 成 0 B/s——真实流量被抹零。改用观测累计字节（每轮把各行正增量累加进
+  // obsUp/obsDown，只增不减）做差分：连接关闭只丢"末轮轮询到关闭之间"不足
+  // 一个轮询周期的尾差，好过整体归零。上方合计卡片仍显示服务器口径的活跃
+  // 字节和（spec §8），不受此影响。
+  if (prevObs && now > prevObs.t) {
+    const dt = (now - prevObs.t) / 1000;
     $("sum-rate").textContent =
-      fmtRate((t.bytesUp - prevTot.up) / dt) + " / " + fmtRate((t.bytesDown - prevTot.down) / dt);
+      fmtRate((obsUp - prevObs.up) / dt) + " / " + fmtRate((obsDown - prevObs.down) / dt);
   }
-  prevTot = {t: now, up: t.bytesUp, down: t.bytesDown};
+  prevObs = {t: now, up: obsUp, down: obsDown};
 }
 
 // ---- DNS 配置 ----
@@ -3044,11 +3055,13 @@ function dnsMsg(text, isErr) {
 async function loadDns() {
   try {
     const r = await fetch("/api/dns", {cache: "no-store"});
-    const doc = await r.json();
+    const doc = await r.json().catch(() => ({}));
     if (!r.ok) { dnsMsg("读取失败: " + (doc.error || ("HTTP " + r.status)), true); return; }
     $("dns-path").textContent = "文件: " + doc.path;
     $("dns-body").innerHTML = "";
-    for (const e of doc.entries) addDnsRow(e.token, (e.domains || []).join(", "), e.note);
+    // 空文件/纯注释文件的 entries 在 Go 端是 nil slice → JSON 里是 null；
+    // || [] 兜底，与 active 的"永不为 null"防御同理（见 admin_test 注释）。
+    for (const e of (doc.entries || [])) addDnsRow(e.token, (e.domains || []).join(", "), e.note);
     dnsMsg("");
   } catch (e) {
     dnsMsg("读取失败: " + e.message, true);
@@ -3080,6 +3093,8 @@ function collectDns() {
 
 async function saveDns() {
   const entries = collectDns();
+  // 空保存合法但是核按钮（spec §7 文件由 UI 托管：全部映射与散注释即刻消失），必须确认。
+  if (entries.length === 0 && !confirm("将清空全部 DNS 映射并落盘，确认保存？")) return;
   try {
     const r = await fetch("/api/dns", {
       method: "PUT",
