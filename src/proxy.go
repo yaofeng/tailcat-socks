@@ -29,6 +29,9 @@ const (
 var (
 	socksOKReply   = []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 	socksFailReply = []byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	// 0x02 = connection not allowed by ruleset（RFC 1928）：目标是策略拒绝的，
+	// 不是网络不通。客户端据此区分"我没权限"和"对面挂了"。
+	socksDeniedReply = []byte{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 )
 
 // Server is the client-facing SOCKS5 front proxy. On each CONNECT it routes
@@ -39,7 +42,11 @@ type Server struct {
 	DNSMap   *DNSMap
 	Dialer   Dialer
 	Registry *ConnRegistry
-	ln       net.Listener
+	// Users 是 SOCKS5 认证用户表。认证是强制的，不能为 nil。
+	Users Users
+	// History 可为 nil（历史关闭或打开失败），此时不记录。
+	History *History
+	ln      net.Listener
 	// relayIdle is how long the relay tolerates silence in either direction
 	// before tearing the session down.
 	relayIdle time.Duration
@@ -48,14 +55,21 @@ type Server struct {
 	handshakeTimeout time.Duration
 }
 
-// NewServer binds the listen address. Use ActualAddr for the resolved port
-// (listening on port 0 is useful in tests).
-func NewServer(dnsMap *DNSMap, d Dialer, reg *ConnRegistry, listen string) (*Server, error) {
+// NewServerWithUsers 是带认证的构造器：生产路径走这个。
+func NewServerWithUsers(dnsMap *DNSMap, d Dialer, reg *ConnRegistry, listen string, users Users, hist *History) (*Server, error) {
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return nil, err
 	}
-	return &Server{DNSMap: dnsMap, Dialer: d, Registry: reg, ln: ln, relayIdle: relayIdleTimeout, handshakeTimeout: handshakeTimeout}, nil
+	return &Server{DNSMap: dnsMap, Dialer: d, Registry: reg, Users: users, History: hist,
+		ln: ln, relayIdle: relayIdleTimeout, handshakeTimeout: handshakeTimeout}, nil
+}
+
+// NewServer 是 NewServerWithUsers 的无认证便捷形式，只服务于不需要认证的
+// 单元测试（凭据为空字符串即通过）。生产路径必须走 NewServerWithUsers 并
+// 提供从 config.yaml 构造的真实用户表——认证是强制的。
+func NewServer(dnsMap *DNSMap, d Dialer, reg *ConnRegistry, listen string) (*Server, error) {
+	return NewServerWithUsers(dnsMap, d, reg, listen, noAuthUsers(), nil)
 }
 
 // ActualAddr returns the bound address once NewServer has succeeded.
@@ -108,9 +122,11 @@ func socksFail(client net.Conn) {
 	_, _ = client.Write(socksFailReply)
 }
 
-// serveConn runs the SOCKS5 exchange on one connection, mirroring the Python
-// version byte-for-byte (greeting, CONNECT-only, ATYP 1/3/4, socks5h), then
-// routes the target through the Dialer and relays the pair.
+// serveConn runs the SOCKS5 exchange on one connection: USERNAME/PASSWORD
+// greeting, RFC 1929 sub-negotiation, then CONNECT-only with ATYP 1/3/4. After
+// routing it enforces the user's reach, then dials and relays. A connection
+// that fails auth or is denied by policy never registers a Session and never
+// reaches the Dialer.
 func (s *Server) serveConn(client net.Conn) {
 	// Bound the client-facing handshake reads; the early return paths keep
 	// it armed — we close the conn right after anyway. The dial is bounded
@@ -118,7 +134,7 @@ func (s *Server) serveConn(client net.Conn) {
 	// so a slow dial cannot silently consume the reply window.
 	client.SetDeadline(time.Now().Add(s.handshakeTimeout))
 
-	// --- greeting ---
+	// --- greeting：只接受 USERNAME/PASSWORD（0x02） ---
 	var v [1]byte
 	if _, err := io.ReadFull(client, v[:]); err != nil {
 		return
@@ -134,18 +150,33 @@ func (s *Server) serveConn(client net.Conn) {
 	if _, err := io.ReadFull(client, methods); err != nil {
 		return
 	}
-	noAuth := false
+	userPass := false
 	for _, m := range methods {
-		if m == 0x00 {
-			noAuth = true
+		if m == 0x02 {
+			userPass = true
 			break
 		}
 	}
-	if !noAuth {
-		_, _ = client.Write([]byte{0x05, 0xFF}) // no acceptable methods; best-effort like the failure replies
+	if !userPass {
+		_, _ = client.Write([]byte{0x05, 0xFF})
 		return
 	}
-	if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
+	if _, err := client.Write([]byte{0x05, 0x02}); err != nil {
+		return
+	}
+
+	// --- RFC 1929 子协商 ---
+	username, ok := s.readUserPassAuth(client)
+	if !ok {
+		return
+	}
+	user, authed := s.Users.Authenticate(username.user, username.pass)
+	if !authed {
+		_, _ = client.Write([]byte{0x01, 0x01}) // auth failure
+		slog.Warn("socks auth failed", "user", username.user, "client", client.RemoteAddr().String())
+		return
+	}
+	if _, err := client.Write([]byte{0x01, 0x00}); err != nil {
 		return
 	}
 
@@ -171,29 +202,88 @@ func (s *Server) serveConn(client net.Conn) {
 	}
 
 	target := route(host, port, s.DNSMap.Load())
+	// 授权在路由之后判断：用的是实际要走的通道，不会与后面的拨号分歧。
+	// 被拒的连接从未建立，因此不注册 Session、不记历史。
+	if !user.Mode.Allows(target.Via) {
+		_, _ = client.Write(socksDeniedReply)
+		slog.Warn("socks target denied by user policy", "user", username.user,
+			"mode", user.Mode, "host", host, "port", port, "via", target.Via)
+		return
+	}
+
 	sess := s.Registry.New(client.RemoteAddr().String(), host, target.Host, int(target.Port), target.Via)
 	defer s.Registry.Drop(sess.ID)
+	// 连接结束时并入历史。failed 取反 Opened：没进 relay 的会话就是失败
+	// （拨号失败或客户端在回执后立刻断开）。
+	defer func() {
+		if s.History == nil {
+			return
+		}
+		ip := clientIP(client.RemoteAddr())
+		s.History.Record(time.Now().Format("2006-01-02"), ip, host, int(port),
+			!sess.Opened, sess.BytesUp.Load(), sess.BytesDown.Load())
+	}()
 
 	up, err := s.Dialer.Dial(context.Background(), target)
-	// The dial may have consumed the handshake budget; give the reply a
-	// fresh window (success or failure) so a slow dial cannot silently eat
-	// it.
 	client.SetDeadline(time.Now().Add(s.handshakeTimeout))
 	if err != nil {
 		slog.Warn("dial failed", "via", target.Via, "host", host, "port", target.Port, "err", err)
-		socksFail(client) // 未 MarkOpen：失败的会话不进 sessionsTotal
+		socksFail(client)
 		return
 	}
 	if _, err := client.Write(socksOKReply); err != nil {
-		up.Close() // client never learned CONNECT succeeded; no relay for it
+		up.Close()
 		return
 	}
 	s.Registry.MarkOpen(sess)
 
-	// Handshake over; relay's idle timer governs both legs from here.
 	client.SetDeadline(time.Time{})
-	up.SetDeadline(time.Time{})          // the Dialer hands back deadline-free conns; kept for clarity
-	relay(client, up, s.relayIdle, sess) // relay owns both conns and closes them
+	up.SetDeadline(time.Time{})
+	relay(client, up, s.relayIdle, sess)
+}
+
+// userPassAuth 是一次 RFC 1929 子协商的结果。
+type userPassAuth struct {
+	user, pass string
+}
+
+// readUserPassAuth 读 RFC 1929 的 [ver=1][ulen][uname][plen][pass]。
+// ver 必须是 1；ulen/plen 为 0 时仍合法（空用户名/空密码），由用户表决定
+// 是否放行。任何读取失败或版本不符都返回 ok=false，调用方直接断开。
+func (s *Server) readUserPassAuth(r io.Reader) (userPassAuth, bool) {
+	var head [2]byte
+	if _, err := io.ReadFull(r, head[:]); err != nil {
+		return userPassAuth{}, false
+	}
+	if head[0] != 0x01 {
+		return userPassAuth{}, false
+	}
+	uname := make([]byte, head[1])
+	if _, err := io.ReadFull(r, uname); err != nil {
+		return userPassAuth{}, false
+	}
+	var pl [1]byte
+	if _, err := io.ReadFull(r, pl[:]); err != nil {
+		return userPassAuth{}, false
+	}
+	pass := make([]byte, pl[0])
+	if _, err := io.ReadFull(r, pass); err != nil {
+		return userPassAuth{}, false
+	}
+	return userPassAuth{user: string(uname), pass: string(pass)}, true
+}
+
+// clientIP 从 RemoteAddr 取出纯 IP。历史按 IP 聚合而不是 IP:port——客户端
+// 每次新建连接都会换源端口，带端口会让"当日累计次数"永远是 1。
+func clientIP(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
 }
 
 // readATYPAddr reads a SOCKS5 address of the given ATYP and returns it as a

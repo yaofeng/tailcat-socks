@@ -95,23 +95,43 @@ func nextTarget(t *testing.T, fd *fakeDialer) Target {
 	}
 }
 
-// socksConnect dials the proxy and completes greeting + CONNECT.
+// socksAuth completes the SOCKS5 greeting (offering only USERNAME/PASSWORD)
+// and the RFC 1929 sub-negotiation with empty credentials — the table
+// NewServer installs. Tests that hand-build a CONNECT request (BIND, IP
+// literal, raw bytes) use this; socksConnect wraps it with a domain CONNECT.
+func socksAuth(t *testing.T, c net.Conn) {
+	t.Helper()
+	c.Write([]byte{0x05, 0x01, 0x02})
+	rep := make([]byte, 2)
+	if _, err := io.ReadFull(c, rep); err != nil {
+		c.Close()
+		t.Fatalf("greeting reply: %v", err)
+	}
+	if rep[0] != 0x05 || rep[1] != 0x02 {
+		c.Close()
+		t.Fatalf("greeting refused: %v", rep)
+	}
+	c.Write([]byte{0x01, 0x00, 0x00}) // ver, ulen=0, plen=0
+	auth := make([]byte, 2)
+	if _, err := io.ReadFull(c, auth); err != nil {
+		c.Close()
+		t.Fatalf("auth reply: %v", err)
+	}
+	if auth[1] != 0x00 {
+		c.Close()
+		t.Fatalf("auth failed: %v", auth)
+	}
+}
+
+// socksConnect dials the proxy and completes greeting + RFC1929 + CONNECT
+// using empty credentials (the table NewServer installs).
 func socksConnect(t *testing.T, proxyAddr, host string, port uint16) net.Conn {
 	t.Helper()
 	c, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Write([]byte{0x05, 0x01, 0x00})
-	rep := make([]byte, 2)
-	if _, err := io.ReadFull(c, rep); err != nil {
-		c.Close()
-		t.Fatalf("greeting reply: %v", err)
-	}
-	if rep[0] != 0x05 || rep[1] != 0x00 {
-		c.Close()
-		t.Fatalf("greeting refused: %v", rep)
-	}
+	socksAuth(t, c)
 	req := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}, host...)
 	req = append(req, byte(port>>8), byte(port))
 	c.Write(req)
@@ -213,11 +233,7 @@ func TestSocks5ProxyIPLiteralDialsDirect(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	c.Write([]byte{0x05, 0x01, 0x00})
-	rep := make([]byte, 2)
-	if _, err := io.ReadFull(c, rep); err != nil {
-		t.Fatalf("greeting: %v", err)
-	}
+	socksAuth(t, c)
 	ip := net.ParseIP("2001:db8::1").To16()
 	req := append([]byte{0x05, 0x01, 0x00, 0x04}, ip...)
 	req = append(req, 0x01, 0xBB) // 443
@@ -245,9 +261,7 @@ func TestSocks5ProxyRejectsBind(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	c.Write([]byte{0x05, 0x01, 0x00})
-	rep := make([]byte, 2)
-	io.ReadFull(c, rep)
+	socksAuth(t, c)
 	// CMD=2 (BIND) with an IPv4 ATYP
 	c.Write([]byte{0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0x1F, 0x90})
 	head := make([]byte, 10)
@@ -265,31 +279,6 @@ func TestSocks5ProxyRejectsBind(t *testing.T) {
 	}
 }
 
-func TestSocks5ProxyNoAcceptableMethod(t *testing.T) {
-	fd := dialerToEcho(t)
-	srv := startProxy(t, map[string]string{}, fd)
-
-	c, err := net.DialTimeout("tcp", srv.ActualAddr().String(), 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	c.Write([]byte{0x05, 0x01, 0xFF}) // only user/pass auth
-	rep := make([]byte, 2)
-	c.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := io.ReadFull(c, rep); err != nil {
-		t.Fatalf("reply: %v", err)
-	}
-	if rep[0] != 0x05 || rep[1] != 0xFF {
-		t.Errorf("want 05 FF, got %v", rep)
-	}
-	select {
-	case got := <-fd.targets:
-		t.Errorf("dialer must not be called, got %+v", got)
-	default:
-	}
-}
-
 // TestSocks5ProxyDialFailureRepliesFail: a failed dial must give the client
 // the generic failure reply, byte for byte.
 func TestSocks5ProxyDialFailureRepliesFail(t *testing.T) {
@@ -302,11 +291,7 @@ func TestSocks5ProxyDialFailureRepliesFail(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	c.Write([]byte{0x05, 0x01, 0x00})
-	rep := make([]byte, 2)
-	if _, err := io.ReadFull(c, rep); err != nil {
-		t.Fatalf("greeting: %v", err)
-	}
+	socksAuth(t, c)
 	c.Write([]byte{0x05, 0x01, 0x00, 0x03, 3, 'a', 'b', 'c', 0x00, 0x50})
 	head := make([]byte, 10)
 	c.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -334,11 +319,7 @@ func TestSocks5ProxyOversizedTokenFailsConnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	c.Write([]byte{0x05, 0x01, 0x00})
-	rep := make([]byte, 2)
-	if _, err := io.ReadFull(c, rep); err != nil {
-		t.Fatalf("greeting: %v", err)
-	}
+	socksAuth(t, c)
 	req := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len("big.example"))}, "big.example"...)
 	req = append(req, 0x00, 0x50) // port 80
 	c.Write(req)
@@ -592,5 +573,176 @@ func TestServeConnRegistersAndCountsSession(t *testing.T) {
 	_, tot := srv.Registry.Snapshot()
 	if tot.SessionsTotal != 1 {
 		t.Errorf("sessionsTotal = %d, want 1", tot.SessionsTotal)
+	}
+}
+
+// startProxyWithUsers is startProxy with an explicit auth table, for the
+// per-user reach tests.
+func startProxyWithUsers(t *testing.T, mapping map[string]string, d Dialer, users Users) *Server {
+	t.Helper()
+	dm := &DNSMap{}
+	dm.Store(mapping)
+	srv, err := NewServerWithUsers(dm, d, NewConnRegistry(), "127.0.0.1:0", users, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	go srv.Serve()
+	return srv
+}
+
+// socksAuthConnect 完成 greeting（申请 0x02）+ RFC1929 子协商 + CONNECT。
+// 返回连接与 CONNECT 的 reply code，调用方据此断言授权结果。
+func socksAuthConnect(t *testing.T, proxyAddr, user, pass, host string, port uint16) (net.Conn, byte) {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+	c.Write([]byte{0x05, 0x01, 0x02})
+	rep := make([]byte, 2)
+	if _, err := io.ReadFull(c, rep); err != nil {
+		c.Close()
+		t.Fatalf("greeting reply: %v", err)
+	}
+	if rep[0] != 0x05 || rep[1] != 0x02 {
+		c.Close()
+		t.Fatalf("server must select 0x02, got %v", rep)
+	}
+	sub := []byte{0x01, byte(len(user))}
+	sub = append(sub, user...)
+	sub = append(sub, byte(len(pass)))
+	sub = append(sub, pass...)
+	c.Write(sub)
+	auth := make([]byte, 2)
+	if _, err := io.ReadFull(c, auth); err != nil {
+		c.Close()
+		t.Fatalf("auth reply: %v", err)
+	}
+	if auth[1] != 0x00 {
+		c.Close()
+		return nil, 0xFF // 认证失败，调用方只看 code
+	}
+	req := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}, host...)
+	req = append(req, byte(port>>8), byte(port))
+	c.Write(req)
+	head := make([]byte, 10)
+	if _, err := io.ReadFull(c, head); err != nil {
+		c.Close()
+		t.Fatalf("connect reply: %v", err)
+	}
+	return c, head[1]
+}
+
+func authUsers() Users {
+	return Users{
+		"tailcat": {password: "pw1", Mode: ModeMatchedOnly},
+		"all":     {password: "pw2", Mode: ModeAny},
+	}
+}
+
+func TestSocks5RequiresUsernamePasswordMethod(t *testing.T) {
+	srv := startProxy(t, map[string]string{"a.example.com": "tcAAA"}, dialerToEcho(t))
+	c, err := net.DialTimeout("tcp", srv.ActualAddr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte{0x05, 0x01, 0x00}) // 只提供 no-auth
+	rep := make([]byte, 2)
+	if _, err := io.ReadFull(c, rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep[0] != 0x05 || rep[1] != 0xFF {
+		t.Errorf("no 0x02 offered must be refused with 0xFF, got %v", rep)
+	}
+}
+
+func TestSocks5RejectsWrongPassword(t *testing.T) {
+	fd := dialerToEcho(t)
+	srv := startProxyWithUsers(t, map[string]string{"a.example.com": "tcAAA"}, fd, authUsers())
+	c, code := socksAuthConnect(t, srv.ActualAddr().String(), "tailcat", "wrong", "a.example.com", 443)
+	if c != nil {
+		c.Close()
+	}
+	if code != 0xFF {
+		t.Errorf("wrong password must fail auth, got code %#x", code)
+	}
+	select {
+	case tg := <-fd.targets:
+		t.Fatalf("failed auth must never dial, but dialer saw %+v", tg)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestSocks5MatchedOnlyUserRejectedOnUnmatchedHost(t *testing.T) {
+	fd := dialerToEcho(t)
+	srv := startProxyWithUsers(t, map[string]string{"a.example.com": "tcAAA"}, fd, authUsers())
+	c, code := socksAuthConnect(t, srv.ActualAddr().String(), "tailcat", "pw1", "other.com", 443)
+	if c != nil {
+		c.Close()
+	}
+	if code != 0x02 {
+		t.Errorf("tailcat on unmatched host must be refused with 0x02, got %#x", code)
+	}
+	select {
+	case tg := <-fd.targets:
+		t.Fatalf("denied target must never dial, but dialer saw %+v", tg)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestSocks5MatchedOnlyUserAllowedOnMatchedHost(t *testing.T) {
+	fd := dialerToEcho(t)
+	srv := startProxyWithUsers(t, map[string]string{"a.example.com": "tcAAA"}, fd, authUsers())
+	c, code := socksAuthConnect(t, srv.ActualAddr().String(), "tailcat", "pw1", "a.example.com", 443)
+	if c == nil {
+		t.Fatalf("matched host should connect, got code %#x", code)
+	}
+	defer c.Close()
+	if code != 0x00 {
+		t.Errorf("reply code = %#x, want 0x00", code)
+	}
+	if tg := nextTarget(t, fd); tg.Via != ViaTunnel {
+		t.Errorf("via = %s, want tunnel", tg.Via)
+	}
+}
+
+func TestSocks5AnyUserAllowedOnUnmatchedHost(t *testing.T) {
+	fd := dialerToEcho(t)
+	srv := startProxyWithUsers(t, map[string]string{"a.example.com": "tcAAA"}, fd, authUsers())
+	c, code := socksAuthConnect(t, srv.ActualAddr().String(), "all", "pw2", "other.com", 443)
+	if c == nil {
+		t.Fatalf("any user should reach unmatched hosts, got code %#x", code)
+	}
+	defer c.Close()
+	if code != 0x00 {
+		t.Errorf("reply code = %#x, want 0x00", code)
+	}
+	if tg := nextTarget(t, fd); tg.Via != ViaDirect {
+		t.Errorf("via = %s, want direct", tg.Via)
+	}
+}
+
+// 授权被拒的连接不能出现在 registry 里：它从来没真正建立。
+func TestSocks5DeniedConnectionIsNotRegistered(t *testing.T) {
+	fd := dialerToEcho(t)
+	reg := NewConnRegistry()
+	srv, err := NewServerWithUsers(&DNSMap{}, fd, reg, "127.0.0.1:0", authUsers(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.DNSMap.Store(map[string]string{"a.example.com": "tcAAA"})
+	defer srv.Close()
+	go srv.Serve()
+
+	c, _ := socksAuthConnect(t, srv.ActualAddr().String(), "tailcat", "pw1", "other.com", 443)
+	if c != nil {
+		c.Close()
+	}
+	time.Sleep(150 * time.Millisecond)
+	if snaps, _ := reg.Snapshot(); len(snaps) != 0 {
+		t.Errorf("denied connection must not be registered, got %+v", snaps)
 	}
 }

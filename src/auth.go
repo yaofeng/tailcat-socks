@@ -27,6 +27,12 @@ type User struct {
 // Users 是用户名到用户的映射。构建后只读，可安全并发使用。
 type Users map[string]User
 
+// noAuthUsers 是 NewServer 使用的测试用户表：用户名与密码都为空、权限不限。
+// 它只降低测试的握手负担，不是生产路径——生产必须从 config.yaml 构造用户表。
+func noAuthUsers() Users {
+	return Users{"": {password: "", Mode: ModeAny}}
+}
+
 // dummyUser 用于用户不存在时仍执行一次等价比较。它没有真实用途，password
 // 取值本身也不重要——比较的是摘要，不是明文。
 var dummyUser = User{password: "invalid", Mode: ModeAny}
