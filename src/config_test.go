@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -53,8 +56,13 @@ func TestLoadConfigCreatesDefaultWhenMissing(t *testing.T) {
 		t.Errorf("default all password = %q, want changeme", cfg.Socks.Users["all"])
 	}
 	// 文件必须真的落盘，否则用户的修改会在下次启动时被"重新生成"覆盖。
-	if _, err := os.Stat(path); err != nil {
+	fi, err := os.Stat(path)
+	if err != nil {
 		t.Fatalf("default config was not written: %v", err)
+	}
+	// 文件里有明文密码：umask 会过滤 OpenFile 的 perm，必须 Chmod 钉死 0600。
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("generated config mode = %o, want 0600", got)
 	}
 	// 再读一次必须得到同样的内容（round-trip）。
 	again, err := LoadConfig(path)
@@ -66,14 +74,39 @@ func TestLoadConfigCreatesDefaultWhenMissing(t *testing.T) {
 	}
 }
 
+// 空用户表、空用户名、空白密码都必须拒绝，并且错误要指出具体是哪一项：
+// 只说"配置非法"用户根本不知道改哪里。
 func TestLoadConfigRejectsEmptyUsers(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(path, []byte("socks:\n  users: {}\n"), 0o600); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"empty map", "socks:\n  users: {}\n", "socks.users is empty"},
+		{"zero byte", "", "socks.users is empty"},
+		{"users absent", "history:\n  enabled: true\n", "socks.users is empty"},
+		{"empty password", "socks:\n  users:\n    tailcat: \"\"\n", `socks.users["tailcat"] has an empty password`},
+		{"blank password", "socks:\n  users:\n    tailcat: \"   \"\n", `socks.users["tailcat"] has an empty password`},
+		{"empty username", "socks:\n  users:\n    \"\": hunter2\n", `socks.users[""] has an empty username`},
 	}
-	if _, err := LoadConfig(path); err == nil {
-		t.Fatal("empty users must be an error: authentication is mandatory")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadConfig(path)
+			if err == nil {
+				t.Fatal("config must be rejected: authentication is mandatory")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to contain %q", err, tc.want)
+			}
+			// 出错信息会进日志和终端，绝不能把密码本身打出来。
+			if strings.Contains(err.Error(), "hunter2") {
+				t.Errorf("error leaks the password: %q", err)
+			}
+		})
 	}
 }
 
@@ -84,5 +117,55 @@ func TestLoadConfigRejectsMalformedYAML(t *testing.T) {
 	}
 	if _, err := LoadConfig(path); err == nil {
 		t.Fatal("malformed YAML must be an error, never silently guessed")
+	}
+}
+
+// 拼错的键必须报错：KnownFields 关掉时 history.enabld 会静默关掉历史记录，
+// 这种"配置看起来生效了其实没有"最难查。
+func TestLoadConfigRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "socks:\n  users:\n    tailcat: hunter2\nhistory:\n  enabld: true\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("unknown field must be an error")
+	}
+	if !strings.Contains(err.Error(), "parse config") {
+		t.Errorf("error = %q, want it to mention parse config", err)
+	}
+}
+
+// 既有文件权限过松时只告警、不改权限：文件可能是运维故意留下的，静默 chmod
+// 会让人查不到是谁动的。生成路径才需要自己钉死 0600。
+func TestLoadConfigWarnsOnLoosePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "socks:\n  users:\n    tailcat: hunter2\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	if _, err := LoadConfig(path); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !strings.Contains(buf.String(), "group/others") {
+		t.Errorf("expected a permission warning, got logs: %q", buf.String())
+	}
+	// 告警不等于改权限。
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o644 {
+		t.Errorf("mode = %o, want untouched 0644", got)
 	}
 }
