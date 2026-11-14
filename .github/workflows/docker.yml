@@ -1,0 +1,90 @@
+name: docker
+
+# Builds the image on every push to main and pushes to Docker Hub. The image
+# version comes from .version — the single source of truth for the version
+# number — and is published as v<version> (plus latest). Pull requests build
+# only (no push) so a broken Dockerfile is caught before merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE: yaofeng928/tailcat-socks
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+      # Fully offline suite: loopback listeners + injected fakes, no DERP.
+      - run: go test ./... -race
+        working-directory: src
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # .version is the only place the version number lives; fail loudly rather
+      # than publish an image tagged from a guess.
+      - name: Read version
+        id: ver
+        run: |
+          set -euo pipefail
+          v="$(tr -d '[:space:]' < .version)"
+          if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::.version must hold a bare semantic version, got '$v'"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $v (image tag v$v)"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        # Only push on main; PRs and manual runs build without credentials.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            # v<.version> — the release tag, e.g. v0.9.0
+            type=raw,value=v${{ steps.ver.outputs.version }}
+            # latest tracks main
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # immutable sha tag for every build
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          # CI runners reach proxy.golang.org directly; the image default
+          # (goproxy.cn) only exists for the author's restricted network.
+          build-args: |
+            GOPROXY=https://proxy.golang.org,direct
+            VERSION=${{ steps.ver.outputs.version }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=gha

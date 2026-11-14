@@ -10,12 +10,19 @@ services:
     # miss it. A directory mount tracks the rename, so the proxy sees edits.
     volumes:
       - ../:/app/config:ro
+      - tailcat-client-key:/data        # persistent tailcat client identity (writable)
     ports:
       - "1080:1080"                     # SOCKS5 for clients: --socks5-hostname <host>:1080
+      # - "8080:8080"                   # admin page from host: ALSO uncomment ADMIN_ADDR below
     environment:
       LISTEN: "0.0.0.0:1080"            # bind all ifaces inside the container
-      UPSTREAM: "127.0.0.1:0"           # tailcat socks -> random high port (internal)
       DNS_FILE: "/app/config/data/dns.txt"  # live-mounted, hot-reloaded
-      TAILCAT_BIN: "tailcat"
+      # Admin defaults to 127.0.0.1:8080 INSIDE the container (unreachable
+      # from the host, on purpose: the page has NO auth). To open it:
+      # uncomment BOTH this line and the ports mapping above.
+      # ADMIN_ADDR: "0.0.0.0:8080"
     restart: unless-stopped
     # tailcat needs to reach DERP/STUN over the network; give it outbound access.
+
+volumes:
+  tailcat-client-key:

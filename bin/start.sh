@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Start tailcat-socks in the background.
 # Config via env (all optional):
-#   LISTEN=127.0.0.1:1080  DNS_FILE=<root>/data/dns.txt  UPSTREAM=127.0.0.1:0
-#   TAILCAT_BIN=tailcat    PROXY_ARGS="extra flags"
+#   LISTEN=127.0.0.1:1080  DNS_FILE=<root>/data/dns.txt  PROXY_ARGS="extra flags"
+# The binary itself reads ADMIN_ADDR and TAILCAT_CLIENT_KEY_FILE (flag > env >
+# default), so just export them; PROXY_ARGS can also pass --admin-addr.
 # PROXY_ARGS is word-split and glob-expanded by the shell (intended for
 # multiple flags); avoid spaces inside individual flag values.
 set -euo pipefail
@@ -16,8 +17,6 @@ LOG_FILE="$RUN_DIR/tailcat-socks-go.log"
 
 LISTEN="${LISTEN:-127.0.0.1:1080}"
 DNS_FILE="${DNS_FILE:-$ROOT/data/dns.txt}"
-UPSTREAM="${UPSTREAM:-127.0.0.1:0}"
-TAILCAT_BIN="${TAILCAT_BIN:-tailcat}"
 
 mkdir -p "$RUN_DIR"
 
@@ -42,15 +41,18 @@ if [[ -f "$PID_FILE" ]]; then
   rm -f "$PID_FILE"
 fi
 
-# Build the proxy if the binary is missing (requires the Go toolchain).
+# Build the proxy if the binary is missing (requires the Go toolchain). The
+# version comes from .version so a bare script build reports the same number as
+# the published image.
 if [[ ! -x "$BIN" ]]; then
   echo "go binary missing; building (go build)..."
-  (cd "$ROOT/src" && go build -o "$ROOT/bin/tailcat-socks" .)
+  VER="$(tr -d '[:space:]' < "$ROOT/.version" 2>/dev/null || echo dev)"
+  (cd "$ROOT/src" && go build -ldflags="-X main.version=$VER" -o "$ROOT/bin/tailcat-socks" .)
 fi
 
 : > "$LOG_FILE"   # truncate on each fresh start
 
-ARGS=(--listen "$LISTEN" --dns-file "$DNS_FILE" --upstream "$UPSTREAM" --tailcat-bin "$TAILCAT_BIN")
+ARGS=(--listen "$LISTEN" --dns-file "$DNS_FILE")
 nohup "$BIN" "${ARGS[@]}" ${PROXY_ARGS:-} >>"$LOG_FILE" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
