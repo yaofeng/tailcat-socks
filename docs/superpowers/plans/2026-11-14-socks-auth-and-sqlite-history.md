@@ -58,6 +58,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -127,8 +128,73 @@ func TestLoadConfigRejectsEmptyUsers(t *testing.T) {
 	if err := os.WriteFile(path, []byte("socks:\n  users: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadConfig(path); err == nil {
+	_, err := LoadConfig(path)
+	if err == nil {
 		t.Fatal("empty users must be an error: authentication is mandatory")
+	}
+	// 断言原因而不只是"有错"：这是安全决策的守卫，任何无关错误都不该让它通过。
+	if !strings.Contains(err.Error(), "socks.users") {
+		t.Errorf("error should name socks.users, got %v", err)
+	}
+}
+
+// 空用户名 / 空密码等于"知道用户名就能连"，必须拒绝。空密码尤其危险：
+// Authenticate 用 ConstantTimeCompare("", "") 会返回 true。
+func TestLoadConfigRejectsBlankCredentials(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"empty password", "socks:\n  users:\n    tailcat: \"\"\n", "empty password"},
+		{"whitespace password", "socks:\n  users:\n    tailcat: \"   \"\n", "empty password"},
+		{"empty username", "socks:\n  users:\n    \"\": pw\n", "empty username"},
+		{"users key absent", "socks: {}\n", "socks.users"},
+		{"users null", "socks:\n  users: null\n", "socks.users"},
+		{"zero byte file", "", "socks.users"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadConfig(path)
+			if err == nil {
+				t.Fatalf("%s must be rejected", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error should mention %q, got %v", tt.want, err)
+			}
+		})
+	}
+}
+
+// 拼写错误必须报错而不是静默关掉历史功能（spec：配置坏了不能猜）。
+func TestLoadConfigRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "socks:\n  users:\n    tailcat: pw\nhistory:\n  enabld: true\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("unknown field enabld must be an error, not a silent disable")
+	}
+}
+
+// 生成的配置含明文密码，权限必须钉死 0600（WriteFile 的 perm 会被 umask
+// 过滤，所以实现里额外 Chmod——与 dialer.go 的私钥文件一致）。
+func TestLoadConfigGeneratedFileModeIs0600(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if _, err := LoadConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("generated config mode = %o, want 600", got)
 	}
 }
 
@@ -160,7 +226,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -188,46 +256,87 @@ type Config struct {
 		Users map[string]string `yaml:"users"`
 	} `yaml:"socks"`
 	History struct {
-		Enabled bool   `yaml:"enabled"`
-		Path    string `yaml:"path"`
+		Enabled bool `yaml:"enabled"`
+		// Path 相对于**进程工作目录**解析，不是配置文件所在目录——与
+		// --dns-file / --client-key-file 一致，避免两套路径语义。容器里
+		// 要写绝对路径（如 /data/history.db），否则库落在镜像层里，容器
+		// 重建即丢。
+		Path string `yaml:"path"`
 	} `yaml:"history"`
 }
 
 // LoadConfig 读取并解析 path。文件不存在时写出一份模板并返回其解析结果，
-// 让首次启动可用；解析失败或用户表为空则返回错误——认证是强制项，空用户
-// 表等于谁都不能连，这种配置只能是笔误，不该被静默接受。
+// 让首次启动可用；解析失败、未知字段、空用户表、空用户名或空密码一律返回
+// 错误——认证是强制项，"谁都能连"的配置只能是笔误，不该被静默接受。
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		if werr := os.WriteFile(path, []byte(configTemplate), 0o600); werr != nil {
-			return nil, fmt.Errorf("write default config %s: %w", path, werr)
+		if werr := writeDefaultConfig(path); werr != nil {
+			return nil, werr
 		}
-		slogWarnDefaultConfig(path)
 		data = []byte(configTemplate)
 	} else if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
+	} else if fi, serr := os.Stat(path); serr == nil && fi.Mode().Perm()&0o077 != 0 {
+		// 只警告不改权限：文件是操作员的，怎么放权由他决定；但明文密码
+		// 被同组/其他人可读这件事必须让他知道。
+		slog.Warn("config holds plaintext passwords but is readable by group/others",
+			"path", path, "mode", fi.Mode().Perm())
 	}
 
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	// KnownFields 让 enabld: 这类拼写错误报错，而不是静默把 history 关掉
+	// ——spec 的立场是"配置坏了不能猜"。
+	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if len(cfg.Socks.Users) == 0 {
-		return nil, fmt.Errorf("config %s: socks.users is empty; at least one user is required (authentication is mandatory)", path)
+		return nil, fmt.Errorf(`config %s: socks.users is empty; at least one user is required (authentication is mandatory), e.g.
+  socks:
+    users:
+      tailcat: "<password>"`, path)
+	}
+	for name, pw := range cfg.Socks.Users {
+		if name == "" {
+			return nil, fmt.Errorf("config %s: socks.users has an entry with an empty username", path)
+		}
+		if strings.TrimSpace(pw) == "" {
+			// 不回显密码本身：错误串会进日志。
+			return nil, fmt.Errorf("config %s: socks.users[%q] has an empty password", path, name)
+		}
 	}
 	return &cfg, nil
 }
-```
 
-`config.go` 还需要 `slogWarnDefaultConfig`。为避免与 `config_test.go` 的断言顺序纠缠，直接在同文件定义：
-
-```go
-func slogWarnDefaultConfig(path string) {
+// writeDefaultConfig 落盘默认模板。用 O_EXCL 而不是 WriteFile：读→写之间
+// 文件可能被别人创建，此时 truncate 会毁掉它；写入中途失败（如 ENOSPC）
+// 留下半截文件更糟——下次启动解析失败，且因为文件已存在再也不会自动重建。
+// 所以先创建、写失败就连文件一起删掉。
+func writeDefaultConfig(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("write default config %s: %w", path, err)
+	}
+	if _, werr := f.WriteString(configTemplate); werr != nil {
+		f.Close()
+		os.Remove(path)
+		return fmt.Errorf("write default config %s: %w", path, werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		os.Remove(path)
+		return fmt.Errorf("write default config %s: %w", path, cerr)
+	}
+	// WriteFile/OpenFile 的 perm 会被 umask 过滤；Chmod 钉死 0600。与
+	// dialer.go 的客户端私钥文件同样的处理（明文密码同属敏感文件）。
+	if cerr := os.Chmod(path, 0o600); cerr != nil {
+		slog.Warn("cannot pin config file mode", "path", path, "err", cerr)
+	}
 	slog.Warn("generated default config with placeholder passwords; edit it before exposing this proxy", "path", path)
+	return nil
 }
 ```
-
-并在 import 中加入 `"log/slog"`。
 
 - [ ] **Step 1.5 运行确认通过**
 
@@ -269,8 +378,8 @@ import "testing"
 
 func testUsers() Users {
 	return Users{
-		"tailcat": {Password: "pw1", Mode: ModeMatchedOnly},
-		"all":     {Password: "pw2", Mode: ModeAny},
+		"tailcat": {password: "pw1", Mode: ModeMatchedOnly},
+		"all":     {password: "pw2", Mode: ModeAny},
 	}
 }
 
@@ -279,15 +388,16 @@ func TestAuthenticate(t *testing.T) {
 	tests := []struct {
 		name, user, pass string
 		want             bool
+		wantMode         Mode
 	}{
-		{"tailcat ok", "tailcat", "pw1", true},
-		{"all ok", "all", "pw2", true},
-		{"wrong password", "tailcat", "nope", false},
-		{"unknown user", "ghost", "pw1", false},
-		{"empty password", "tailcat", "", false},
-		{"empty user", "", "pw1", false},
-		// 密码是区分大小写的：这是 HTTP 代理凭据，不是用户名。
-		{"case sensitive password", "tailcat", "PW1", false},
+		{"tailcat ok", "tailcat", "pw1", true, ModeMatchedOnly},
+		{"all ok", "all", "pw2", true, ModeAny},
+		{"wrong password", "tailcat", "nope", false, ""},
+		{"unknown user", "ghost", "pw1", false, ""},
+		{"empty password", "tailcat", "", false, ""},
+		{"empty user", "", "pw1", false, ""},
+		// 密码是区分大小写的：这是 SOCKS5/RFC1929 凭据，不是用户名。
+		{"case sensitive password", "tailcat", "PW1", false, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -295,8 +405,8 @@ func TestAuthenticate(t *testing.T) {
 			if ok != tt.want {
 				t.Fatalf("Authenticate(%q,%q) ok = %v, want %v", tt.user, tt.pass, ok, tt.want)
 			}
-			if ok && got.Mode == "" {
-				t.Error("authenticated user must carry a Mode")
+			if ok && got.Mode != tt.wantMode {
+				t.Errorf("mode = %q, want %q", got.Mode, tt.wantMode)
 			}
 		})
 	}
@@ -313,12 +423,39 @@ func TestAuthenticateDoesNotCrossUsers(t *testing.T) {
 	}
 }
 
+// 授权边界上的拼写错误必须报错：把 tailatc 当成任意用户就等于静默放开直连。
+func TestModeForUser(t *testing.T) {
+	tests := []struct {
+		name     string
+		want     Mode
+		wantErr  bool
+	}{
+		{"tailcat", ModeMatchedOnly, false},
+		{"all", ModeAny, false},
+		{"Tailcat", "", true},
+		{"tailatc", "", true},
+		{"bob", "", true},
+		{"", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := modeForUser(tt.name)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("modeForUser(%q) err = %v, wantErr %v", tt.name, err, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("modeForUser(%q) = %q, want %q", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAllows(t *testing.T) {
 	tests := []struct {
-		name  string
-		mode  Mode
-		via   string
-		want  bool
+		name string
+		mode Mode
+		via  string
+		want bool
 	}{
 		{"matched-only allows tunnel", ModeMatchedOnly, ViaTunnel, true},
 		{"matched-only rejects direct", ModeMatchedOnly, ViaDirect, false},
@@ -331,6 +468,21 @@ func TestAllows(t *testing.T) {
 				t.Errorf("%s.Allows(%s) = %v, want %v", tt.mode, tt.via, got, tt.want)
 			}
 		})
+	}
+}
+
+// 未知模式与未知通道必须失败关闭：将来有人加个 default: return true 就是
+// 静默放开全部目标。
+func TestAllowsFailsClosed(t *testing.T) {
+	for _, m := range []Mode{"", "bogus"} {
+		for _, via := range []string{ViaTunnel, ViaDirect} {
+			if m.Allows(via) {
+				t.Errorf("Mode(%q).Allows(%q) must be false", m, via)
+			}
+		}
+	}
+	if ModeAny.Allows("carrier-pigeon") {
+		t.Error("ModeAny must reject an unknown via instead of treating it as allowed")
 	}
 }
 ```
@@ -360,38 +512,48 @@ const (
 	ModeAny Mode = "any"
 )
 
-// User 是 config.yaml 里的一个 SOCKS5 用户。
+// User 是 config.yaml 里的一个 SOCKS5 用户。password 不导出：这个结构会被
+// 到处传递，导出的明文字段迟早被某条 slog.Debug 打出来。
 type User struct {
-	Password string
+	password string
 	Mode     Mode
 }
 
 // Users 是用户名到用户的映射。构建后只读，可安全并发使用。
 type Users map[string]User
 
-// modeForUser 把配置里的用户名翻译成授权模式。用户名是策略的一部分而不是
-// 自由标签：tailcat 意味着"只走命中隧道"，其余名字按 all 处理——这样配置
-// 里写错用户名时不会意外放大权限，而是退化成最宽但显式的 any。
-//
-// 注意：这里刻意不按配置里出现的顺序猜。只有 "tailcat" 收窄，其他一律 any。
-func modeForUser(name string) Mode {
-	if name == "tailcat" {
-		return ModeMatchedOnly
+// dummyUser 在用户不存在时占位，让比较走与"密码错误"完全相同的路径。
+var dummyUser = User{password: "invalid", Mode: ModeAny}
+
+// modeForUser 把配置里的用户名翻译成授权模式。只认两个名字：tailcat 收窄到
+// 只走命中隧道，all 不限。其余名字一律报错而不是退化成 ModeAny——授权边界
+// 上的拼写错误（tailatc / Tailcat）会静默放大成完全直连权限，与 config.go 用
+// KnownFields 拒绝拼错的键是同一个立场：配置写错了就得说。
+func modeForUser(name string) (Mode, error) {
+	switch name {
+	case "tailcat":
+		return ModeMatchedOnly, nil
+	case "all":
+		return ModeAny, nil
 	}
-	return ModeAny
+	return "", fmt.Errorf("unknown socks user %q: only \"tailcat\" (matched-only) and \"all\" (unrestricted) are supported", name)
 }
 
-// Authenticate 校验 user/password，成功时返回该用户与其模式。密码用常量
-// 时间比较，避免通过响应时间逐字节猜测——代理端口可能暴露在网络上。
-// 用户不存在时也与错误密码走同样多的比较工作（用一个哑用户占位）。
+// Authenticate 校验 user/password，成功时返回该用户与其模式。比较的是
+// 定长摘要而不是明文：subtle.ConstantTimeCompare 在长度不等时提前返回，
+// 直接比较明文会把"密码长度"泄漏成时序差异，也就能区分"用户不存在"与
+// "密码错误"。摘要长度恒定，未知用户与错误密码才真正走等价的工作量。
+//
+// 空用户名/空密码由 LoadConfig 拒绝（config.go），不在这里拦截——不要
+// 因为看到这里的 ("" , "") 能通过就把那条校验删掉。
 func (u Users) Authenticate(user, password string) (User, bool) {
-	dummy := User{Password: "\x00invalid\x00", Mode: ModeAny}
 	got, ok := u[user]
 	if !ok {
-		got = dummy
+		got = dummyUser
 	}
-	// 无论用户是否存在都执行一次比较，保持时序一致。
-	match := subtle.ConstantTimeCompare([]byte(got.Password), []byte(password)) == 1
+	gotSum := sha256.Sum256([]byte(got.password))
+	inSum := sha256.Sum256([]byte(password))
+	match := subtle.ConstantTimeCompare(gotSum[:], inSum[:]) == 1
 	if !ok || !match {
 		return User{}, false
 	}
@@ -405,7 +567,8 @@ func (m Mode) Allows(via string) bool {
 	case ModeMatchedOnly:
 		return via == ViaTunnel
 	case ModeAny:
-		return true
+		// 只认两条已知通道；未知的 via 说明路由出了问题，不该被当成放行。
+		return via == ViaTunnel || via == ViaDirect
 	}
 	return false
 }
@@ -1027,7 +1190,7 @@ func NewServer(dnsMap *DNSMap, d Dialer, reg *ConnRegistry, listen string) (*Ser
 // noAuthUsers 是 NewServer 使用的测试用户表：用户名与密码都为空、权限不限。
 // 它只降低测试的握手负担，不是生产路径——生产必须从 config.yaml 构造用户表。
 func noAuthUsers() Users {
-	return Users{"": {Password: "", Mode: ModeAny}}
+	return Users{"": {password: "", Mode: ModeAny}}
 }
 ```
 
@@ -1605,7 +1768,14 @@ d) 在 `LoadDNSFile` 之后、`NewServer` 之前插入配置与历史初始化�
 	}
 	users := make(Users, len(cfg.Socks.Users))
 	for name, pw := range cfg.Socks.Users {
-		users[name] = User{Password: pw, Mode: modeForUser(name)}
+		// 未知用户名在这里失败：授权边界上的拼写错误（tailatc）不能让
+		// 这个账号静默拿到完全直连权限。
+		mode, merr := modeForUser(name)
+		if merr != nil {
+			slog.Error("bad config", "path", configFile, "err", merr)
+			return 1
+		}
+		users[name] = User{password: pw, Mode: mode}
 	}
 
 	// 历史是旁路功能：打不开就降级为不可用并继续服务，绝不让代理因此拒绝
