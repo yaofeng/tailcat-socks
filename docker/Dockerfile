@@ -31,12 +31,19 @@ RUN apk add --no-cache ca-certificates
 COPY --from=build /out/tailcat-socks /usr/local/bin/tailcat-socks
 
 WORKDIR /app
-# dns.txt holds real tokens and is git-ignored; bake the example as a build
-# fallback (compose mounts your real dns.txt over it at runtime).
+# dns.txt holds real tokens and is git-ignored; bake the examples as build
+# fallbacks so the image starts on its own (compose mounts the real data/
+# over /data at runtime).
 COPY data/dns.txt.example /app/dns.txt
+# config.yaml holds plaintext passwords, so only the example ships in the
+# image. Without it the proxy would generate a file with placeholder
+# "changeme" passwords inside the container — a baked example at least makes
+# the defaults visible in the image.
+COPY data/config.yaml.example /app/config.yaml
 
 ENV LISTEN=0.0.0.0:1080 \
     DNS_FILE=/app/dns.txt \
+    CONFIG_FILE=/app/config.yaml \
     TAILCAT_CLIENT_KEY_FILE=/data/tailcat-client-key \
     ADMIN_ADDR=127.0.0.1:8080
 
@@ -47,4 +54,4 @@ VOLUME ["/data"]
 
 # exec so PID 1 forwards signals -> proxy runs its shutdown order
 # (SOCKS listener, relays, admin Shutdown(1s), tailcat clients).
-CMD ["sh", "-c", "exec tailcat-socks --listen \"$LISTEN\" --dns-file \"$DNS_FILE\" --client-key-file \"$TAILCAT_CLIENT_KEY_FILE\" --admin-addr \"$ADMIN_ADDR\""]
+CMD ["sh", "-c", "exec tailcat-socks --listen \"$LISTEN\" --dns-file \"$DNS_FILE\" --config \"$CONFIG_FILE\" --client-key-file \"$TAILCAT_CLIENT_KEY_FILE\" --admin-addr \"$ADMIN_ADDR\""]

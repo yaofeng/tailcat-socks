@@ -1,28 +1,31 @@
 services:
   tailcat-socks:
     build:
-      context: ..                       # repo root so COPY src/ + data/dns.txt.example resolve
+      context: ..                       # repo root so COPY src/ + data/*.example resolve
       dockerfile: docker/Dockerfile
     image: yaofeng928/tailcat-socks:latest
     container_name: tailcat-socks
     # Mount the CONTAINING DIRECTORY (not the file): editors replace files on
     # save, and a file-level bind-mount pins the old inode so hot-reload would
     # miss it. A directory mount tracks the rename, so the proxy sees edits.
+    #
+    # The repo's data/ directory carries dns.txt, config.yaml and history.db, so
+    # mounting it read-write at /data puts all three at their default
+    # (cwd-relative) paths and keeps history across container recreation.
+    # Read-write is deliberate: the admin page rewrites dns.txt there and the
+    # history db lives there too.
     volumes:
-      - ../:/app/config:ro
-      - tailcat-client-key:/data        # persistent tailcat client identity (writable)
+      - ../data:/data
     ports:
       - "1080:1080"                     # SOCKS5 for clients: --socks5-hostname <host>:1080
-      # - "8080:8080"                   # admin page from host: ALSO uncomment ADMIN_ADDR below
+      # - "8080:8080"                   # admin page from host: ALSO set ADMIN_ADDR below
     environment:
       LISTEN: "0.0.0.0:1080"            # bind all ifaces inside the container
-      DNS_FILE: "/app/config/data/dns.txt"  # live-mounted, hot-reloaded
-      # Admin defaults to 127.0.0.1:8080 INSIDE the container (unreachable
-      # from the host, on purpose: the page has NO auth). To open it:
-      # uncomment BOTH this line and the ports mapping above.
+      DNS_FILE: "/data/dns.txt"         # live-mounted, hot-reloaded
+      # Admin defaults to 127.0.0.1:8080 INSIDE the container (unreachable from
+      # the host on purpose: the page has NO authentication). To open it, set
+      # ADMIN_ADDR to 0.0.0.0:8080 AND uncomment the port mapping above. That
+      # exposes an unauthenticated page to the host network — do it knowingly.
       # ADMIN_ADDR: "0.0.0.0:8080"
     restart: unless-stopped
     # tailcat needs to reach DERP/STUN over the network; give it outbound access.
-
-volumes:
-  tailcat-client-key:

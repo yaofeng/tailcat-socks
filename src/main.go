@@ -47,10 +47,12 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})).With("component", "tailcat-socks"))
 	// flag.Visit reports only flags actually set on the command line, so an
 	// explicit flag keeps priority even when its value equals the default.
-	// Env fallbacks: TAILCAT_CLIENT_KEY_FILE, ADMIN_ADDR ("" disables).
+	// Env fallbacks: TAILCAT_CLIENT_KEY_FILE, ADMIN_ADDR ("" disables),
+	// CONFIG_FILE.
 	explicit := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
-	os.Exit(run(*listen, *dnsFile, *configFile,
+	os.Exit(run(*listen, *dnsFile,
+		resolveSetting(explicit["config"], "CONFIG_FILE", *configFile),
 		resolveSetting(explicit["client-key-file"], "TAILCAT_CLIENT_KEY_FILE", *clientKeyFile),
 		resolveSetting(explicit["admin-addr"], "ADMIN_ADDR", *adminAddr),
 		*noWatch))
