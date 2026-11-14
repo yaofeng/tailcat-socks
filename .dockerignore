@@ -1,6 +1,13 @@
 .git
 run/
 bin/
+# Real data must never reach the build context: dns.txt holds tokens,
+# config.yaml plaintext passwords, the client key is a private identity, and
+# the history db (plus its WAL/SHM companions) holds access records. Only the
+# *.example files are baked into the image.
 data/dns.txt
 data/config.yaml
 data/history.db
+data/history.db-wal
+data/history.db-shm
+data/tailcat-client-key
