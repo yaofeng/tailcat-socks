@@ -746,3 +746,32 @@ func TestSocks5DeniedConnectionIsNotRegistered(t *testing.T) {
 		t.Errorf("denied connection must not be registered, got %+v", snaps)
 	}
 }
+
+func TestClientIPStripsPort(t *testing.T) {
+	tests := []struct {
+		name string
+		addr net.Addr
+		want string
+	}{
+		{"v4 with port", &net.TCPAddr{IP: net.ParseIP("172.16.2.233"), Port: 58214}, "172.16.2.233"},
+		{"v6 with port", &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443}, "2001:db8::1"},
+		{"nil addr", nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clientIP(tt.addr); got != tt.want {
+				t.Errorf("clientIP(%v) = %q, want %q", tt.addr, got, tt.want)
+			}
+		})
+	}
+}
+
+// 历史按 IP 聚合：同一客户端换源端口必须落进同一行，否则"当日累计次数"
+// 永远等于 1。
+func TestClientIPSameClientDifferentPortsFoldTogether(t *testing.T) {
+	a := &net.TCPAddr{IP: net.ParseIP("10.0.0.5"), Port: 1000}
+	b := &net.TCPAddr{IP: net.ParseIP("10.0.0.5"), Port: 2000}
+	if clientIP(a) != clientIP(b) {
+		t.Errorf("same client with different ports must yield the same key: %q vs %q", clientIP(a), clientIP(b))
+	}
+}
