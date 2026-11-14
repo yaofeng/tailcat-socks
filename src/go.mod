@@ -5,6 +5,7 @@ go 1.27.1
 require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/tailscale/tailcat v0.7.0
+	gopkg.in/yaml.v3 v3.0.1
 	tailscale.com v1.103.0-pre.0.20260916030321-a2263542f260
 )
 
