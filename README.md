@@ -54,16 +54,22 @@ tcDEF456ghi foo.com bar.com
 # 首次:从示例生成自己的映射文件,填入真实 token(此文件已被 git 忽略,勿提交)
 cp data/dns.txt.example data/dns.txt && $EDITOR data/dns.txt
 
-# 构建一次
-(cd src && go build -o ../bin/tailcat-socks .)
+# 首次:配置认证用户。也可以跳过——首次启动会自动生成一份带占位密码的
+# 模板,但那两个 changeme 必须改掉再用。
+cp data/config.yaml.example data/config.yaml && chmod 600 data/config.yaml
+$EDITOR data/config.yaml
+
+# 构建一次(版本号来自 .version)
+(cd src && go build -ldflags="-X main.version=$(cat ../.version)" -o ../bin/tailcat-socks .)
 
 # 前台运行:SOCKS5 127.0.0.1:1080,管理页 http://127.0.0.1:8080/
 bin/tailcat-socks
 
-# 用起来
-curl --socks5-hostname 127.0.0.1:1080 http://www.example.com:8888/health
+# 用起来(必须带凭据)
+curl --socks5-hostname 127.0.0.1:1080 --proxy-user tailcat:你的密码 http://www.example.com:8888/health
 # 或给整个进程注入
-export all_proxy=socks5h://127.0.0.1:1080
+
+export all_proxy=socks5h://tailcat:你的密码@127.0.0.1:1080
 ```
 
 ### 命令行参数
@@ -72,6 +78,7 @@ export all_proxy=socks5h://127.0.0.1:1080
 |---|---|---|---|
 | `--listen` | `127.0.0.1:1080` | – | 面向客户端的 SOCKS5 监听地址 |
 | `--dns-file` | `data/dns.txt` | – | 域名→token 映射文件 |
+| `--config` | `data/config.yaml` | – | 配置文件;不存在时自动生成默认模板 |
 | `--client-key-file` | `data/tailcat-client-key` | `TAILCAT_CLIENT_KEY_FILE` | tailcat 客户端身份文件(JSON) |
 | `--admin-addr` | `127.0.0.1:8080` | `ADMIN_ADDR` | 管理页/API 监听地址;**空串完全禁用** |
 | `--no-watch` | 关 | – | 关闭 dns.txt 热加载 |
@@ -104,9 +111,64 @@ bin/tailcat-socks --version    # 0.9.0
 TS_DEBUG_ALWAYS_USE_DERP=0 bin/tailcat-socks
 ```
 
+## 配置(data/config.yaml)
+
+首次启动时若文件不存在会**自动生成**一份模板并打 WARN。模板里的密码是占位的
+`changeme`,**暴露到网络前务必修改**。文件含明文密码,权限应为 0600,已被 git
+忽略。配置在启动时读取一次,改完需重启。
+
+```yaml
+socks:
+  users:
+    tailcat: "changeme"      # 只能访问 dns.txt 命中的域名(走隧道)
+    all: "changeme"          # 可访问任意目标
+
+history:
+  enabled: true
+  path: "data/history.db"    # 相对路径按进程工作目录解析
+```
+
+- `socks.users` 是**强制项**:为空、用户名为空、密码为空或空白、用户名不是
+  `tailcat` / `all` 之一,都会让启动失败并给出具体原因。用户名决定授权范围,
+  所以拼错的名字不能静默通过。
+- `history.path` 的相对路径按**进程工作目录**解析(与 `--dns-file` 一致)。
+  容器部署请写绝对路径并落在挂载卷里。
+
+## SOCKS5 认证
+
+代理**强制**要求用户名/密码认证(RFC 1929)——不再接受 `0x00` 无认证方式,
+客户端必须同时提供用户名和密码。
+
+| 用户名 | 权限 |
+|---|---|
+| `tailcat` | **只能**访问 `dns.txt` 命中的域名(走隧道);未命中的目标返回 SOCKS5 `0x02`(connection not allowed by ruleset) |
+| `all` | 可访问任意目标:命中走隧道,未命中直连 |
+
+```bash
+# curl:用 --proxy-user 带上凭据
+curl --socks5-hostname 127.0.0.1:1080 --proxy-user tailcat:密码 http://a.example.com/
+curl --socks5-hostname 127.0.0.1:1080 --proxy-user all:密码 http://example.com/
+```
+
+认证失败(`0x01 0x01`)与权限拒绝(`0x02`)都不会写入历史,也不会出现在
+"当前连接"里——它们从未建立连接。
+
+## 历史连接
+
+每次连接结束后,按(日期, 客户端 IP, 域名, 端口)聚合一行写入
+`data/history.db`(SQLite,WAL 模式):当日累计次数、失败次数、上下行字节。
+"失败"指拨号失败或未进入转发阶段;认证失败与权限拒绝不计入。
+
+管理页的**历史连接**标签可按日期查看,列表按累计流量倒序。该标签不轮询——
+历史只在连接结束时变化,切标签或改日期时拉取一次。
+
+历史是**旁路功能**:`history.enabled: false` 或数据库打不开时,功能降级为
+不可用(页面显示"历史记录未启用"),代理继续正常服务,启动日志有 WARN。
+
 ## Web 管理页
 
-- **当前连接**:汇总条(活跃数、累计会话、上/下行合计、聚合速率)+ 每条连接:原始域名、目标(token 或直连 host)、端口、tunnel/direct 徽标、状态(handshake/open)、客户端地址、时长、上/下行字节与速率。速率由页面对相邻两次 1s 采样求差得到;已关闭的连接不保留历史。
+- **当前连接**:汇总条(活跃数、累计会话、上/下行合计、聚合速率)+ 每条连接:原始域名、端口、tunnel/direct 徽标、状态(handshake/open)、客户端地址、时长、上/下行字节与速率。速率由页面对相邻两次 1s 采样求差得到;已关闭的连接不保留历史。
+- **历史连接**:按日期筛选当日聚合,按累计流量倒序;汇总卡给出条目数、总次数、失败次数与上下行合计。
 - **DNS 配置**:表格编辑 token / domains(逗号或空格分隔)/ 备注;"保存并生效"经服务端校验 → 原子落盘 → 立即载入映射,失败会给出条目级原因且文件与映射都不动。
 - 页面**无鉴权**,默认只绑 127.0.0.1,信任本机;要对宿主机/网络开放请自行加反代或防火墙(见 Docker 一节)。
 
@@ -154,7 +216,10 @@ tailcat-socks/
 │   ├── dnsmap.go                     # dns.txt 条目解析 + 原子热加载
 │   ├── dialer.go                     # 路由决策 + 进程内 tailcat 库 + 直连拨号
 │   ├── stats.go                      # ConnRegistry 会话表 + 原子字节计数
-│   ├── proxy.go                      # SOCKS5 服务端 + relay
+│   ├── proxy.go                      # SOCKS5 服务端 + RFC1929 认证 + 授权 + relay
+│   ├── auth.go                       # 用户表、摘要比较、按用户授权范围
+│   ├── config.go                     # config.yaml 加载与校验
+│   ├── history.go                    # SQLite 历史聚合(按日/IP/域名/端口)
 │   ├── admin.go                      # 管理页 HTTP API(go:embed + 单页)
 │   ├── static/index.html             # 管理页(编译期内嵌)
 │   └── *_test.go                     # 单元 + 本地端到端(全离线)
@@ -164,19 +229,23 @@ tailcat-socks/
 ├── data/
 │   ├── dns.txt                       # 域名→token 映射(运行时热加载,gitignore)
 │   ├── dns.txt.example               # 示例映射
+│   ├── config.yaml                   # 认证用户与历史配置(含明文密码,gitignore)
+│   ├── config.yaml.example           # 示例配置
+│   ├── history.db                    # 历史聚合库(自动创建,gitignore)
 │   └── tailcat-client-key            # tailcat 客户端身份(首启自动生成,gitignore)
 └── run/                              # pid + log(脚本生成)
 ```
 
 ## 实现范围
 
-- **支持**: SOCKS5 `CONNECT`;IPv4/IPv6/域名 ATYP;无认证握手;未命中(含 IP)直连;进程内 tailcat 隧道与 client 复用;连接统计与管理页;dns.txt 页内编辑 + 热加载;多线程并发。
-- **不支持**(YAGNI): `UDP ASSOCIATE` / `BIND`(返回失败);用户名/密码认证;Web 鉴权;已关闭连接的历史/图表;exit-node 透传(由直连语义替代)。
+- **支持**: SOCKS5 `CONNECT`;IPv4/IPv6/域名 ATYP;**强制用户名/密码认证(RFC 1929)**;按用户授权(`tailcat` 只走命中隧道、`all` 不限);未命中(含 IP)直连;进程内 tailcat 隧道与 client 复用;连接统计与管理页;**SQLite 历史聚合**;dns.txt 页内编辑 + 热加载;多线程并发。
+- **不支持**(YAGNI): `UDP ASSOCIATE` / `BIND`(返回失败);配置热加载;Web 鉴权;多日区间查询与图表;历史数据清理/归档;exit-node 透传(由直连语义替代)。
 
 ## 测试
 
 ```bash
 cd src && go test ./...             # 全离线:本地回环 + 注入 fake,无外网依赖
+cd src && go test ./... -race
 ```
 
-覆盖 dns.txt 条目解析/校验/原子保存、路由决策、注册表计数、SOCKS5 改写与 relay(含半关不 RST)、admin API 契约。真实隧道 e2e 依赖外网 DERP,手工清单:起服务 → 配一个可达 token → `curl --socks5-hostname` 打过去 → 管理页出现该连接且字节/速率增长 → 页内改映射立即生效。
+覆盖 dns.txt 条目解析/校验/原子保存、路由决策、注册表计数、SOCKS5 改写与 relay(含半关不 RST)、RFC1929 认证与按用户授权、admin API 契约、配置加载与校验、SQLite 历史聚合(含并发写入与 DSN 处理)。真实隧道 e2e 依赖外网 DERP,手工清单:起服务 → 配一个可达 token → `curl --socks5-hostname --proxy-user tailcat:密码` 打过去 → 管理页出现该连接且字节/速率增长 → 页内改映射立即生效 → 历史标签出现当日记录。

@@ -28,6 +28,7 @@ func main() {
 	var (
 		listen        = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address (host:port; empty host binds all interfaces)")
 		dnsFile       = flag.String("dns-file", "data/dns.txt", "domain->token mapping file")
+		configFile    = flag.String("config", "data/config.yaml", "config file (created with defaults if missing)")
 		clientKeyFile = flag.String("client-key-file", "data/tailcat-client-key", "persistent tailcat client identity (JSON)")
 		adminAddr     = flag.String("admin-addr", "127.0.0.1:8080", "admin page/API address (host:port; empty disables)")
 		noWatch       = flag.Bool("no-watch", false, "disable dns.txt hot-reload")
@@ -49,13 +50,13 @@ func main() {
 	// Env fallbacks: TAILCAT_CLIENT_KEY_FILE, ADMIN_ADDR ("" disables).
 	explicit := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
-	os.Exit(run(*listen, *dnsFile,
+	os.Exit(run(*listen, *dnsFile, *configFile,
 		resolveSetting(explicit["client-key-file"], "TAILCAT_CLIENT_KEY_FILE", *clientKeyFile),
 		resolveSetting(explicit["admin-addr"], "ADMIN_ADDR", *adminAddr),
 		*noWatch))
 }
 
-func run(listen, dnsFile, clientKeyFile, adminAddr string, noWatch bool) int {
+func run(listen, dnsFile, configFile, clientKeyFile, adminAddr string, noWatch bool) int {
 	// Install the signal handler before doing anything else: stopNotify is
 	// deferred FIRST so it runs LAST — the handler stays installed until
 	// run() actually returns, so a repeat Ctrl-C during shutdown is
@@ -73,6 +74,38 @@ func run(listen, dnsFile, clientKeyFile, adminAddr string, noWatch bool) int {
 	}
 	dnsMap := &DNSMap{}
 	dnsMap.Store(first)
+
+	// 认证是强制项，配置必须在监听之前就位：解析失败或用户表不合法时
+	// 直接退出，不能先开端口再发现没人能连。
+	cfg, err := LoadConfig(configFile)
+	if err != nil {
+		slog.Error("cannot load config", "path", configFile, "err", err)
+		return 1
+	}
+	users := make(Users, len(cfg.Socks.Users))
+	for name, pw := range cfg.Socks.Users {
+		// LoadConfig 已经校验过用户名的合法性，这里不会失败；仍检查是因为
+		// 授权范围不允许"猜一个默认值"。
+		mode, merr := modeForUser(name)
+		if merr != nil {
+			slog.Error("bad config", "path", configFile, "err", merr)
+			return 1
+		}
+		users[name] = User{password: pw, Mode: mode}
+	}
+
+	// 历史是旁路功能：打不开就降级为不可用并继续服务，绝不因此拒绝启动。
+	var history *History
+	if cfg.History.Enabled {
+		history, err = OpenHistory(cfg.History.Path)
+		if err != nil {
+			slog.Warn("history disabled: cannot open database", "path", cfg.History.Path, "err", err)
+			history = nil
+		}
+	}
+	if history != nil {
+		defer history.Close()
+	}
 
 	// Validate --listen: SplitHostPort for the host:port shape plus a numeric
 	// in-range port, so junk like "host:abc" is reported here instead of by
@@ -97,7 +130,7 @@ func run(listen, dnsFile, clientKeyFile, adminAddr string, noWatch bool) int {
 	// clobbers the file.
 	dialer := NewAppDialer(clientKeyFile)
 	registry := NewConnRegistry()
-	srv, err := NewServer(dnsMap, dialer, registry, listen)
+	srv, err := NewServerWithUsers(dnsMap, dialer, registry, listen, users, history)
 	if err != nil {
 		slog.Error("cannot listen", "addr", listen, "err", err)
 		return 1
@@ -109,6 +142,7 @@ func run(listen, dnsFile, clientKeyFile, adminAddr string, noWatch bool) int {
 	var adminSrv *http.Server
 	if adminAddr != "" {
 		api := NewAdmin(registry, dnsMap, dnsFile)
+		api.SetHistory(history)
 		adminLn, err := net.Listen("tcp", adminAddr)
 		if err != nil {
 			slog.Error("cannot listen admin", "addr", adminAddr, "err", err)

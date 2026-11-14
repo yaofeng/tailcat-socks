@@ -83,6 +83,12 @@ func LoadConfig(path string) (*Config, error) {
 		if strings.TrimSpace(pw) == "" {
 			return nil, fmt.Errorf("config %s: socks.users[%q] has an empty password", path, user)
 		}
+		// 用户名决定授权范围，所以拼错的名字（tailatc / Tailcat）不是"多了个
+		// 普通账号"，而是静默放大权限或不生效。在这里就拒掉，别等到构造
+		// Users 时才发现——那时配置已被接受过一次了。
+		if _, merr := modeForUser(user); merr != nil {
+			return nil, fmt.Errorf("config %s: %w", path, merr)
+		}
 	}
 	// 到这里配置已经能用，才谈权限。只提示不改：既有文件的权限可能是运维
 	// 有意为之，静默 chmod 会让"谁动的权限"变成无头案；生成路径才由我们

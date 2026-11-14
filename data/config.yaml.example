@@ -1,0 +1,15 @@
+# tailcat-socks 配置示例。复制为 data/config.yaml 并修改密码。
+# 真实配置文件含明文密码，已被 git 忽略，权限请保持 0600。
+socks:
+  users:
+    # tailcat: 只能访问 dns.txt 命中的域名（走隧道）
+    tailcat: "changeme"
+    # all: 可访问任意目标（命中走隧道，未命中直连）
+    all: "changeme"
+
+history:
+  # 关掉后不打开数据库，管理页的"历史连接"标签会显示未启用。
+  enabled: true
+  # 相对路径按进程工作目录解析（与 --dns-file 一致）。容器部署请用绝对
+  # 路径并落在挂载卷里，否则容器重建后历史就没了。
+  path: "data/history.db"

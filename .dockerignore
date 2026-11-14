@@ -2,3 +2,5 @@
 run/
 bin/
 data/dns.txt
+data/config.yaml
+data/history.db

@@ -169,3 +169,44 @@ func TestLoadConfigWarnsOnLoosePermissions(t *testing.T) {
 		t.Errorf("mode = %o, want untouched 0644", got)
 	}
 }
+
+// 用户名决定授权范围，拼错的名字不能静默通过：tailatc 既不是 tailcat（收窄）
+// 也不该被当成"又一个普通账号"。只认 tailcat 与 all 两个名字。
+func TestLoadConfigRejectsUnknownUsernames(t *testing.T) {
+	cases := []struct{ name, body string }{
+		{"typo", "socks:\n  users:\n    tailatc: pw\n"},
+		{"wrong case", "socks:\n  users:\n    Tailcat: pw\n"},
+		{"arbitrary name", "socks:\n  users:\n    bob: pw\n"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadConfig(path)
+			if err == nil {
+				t.Fatalf("%s must be rejected", tt.name)
+			}
+			if !strings.Contains(err.Error(), "unknown socks user") {
+				t.Errorf("error should name the unknown user, got %v", err)
+			}
+		})
+	}
+}
+
+// 两个合法用户名必须仍能加载。
+func TestLoadConfigAcceptsBothKnownUsers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "socks:\n  users:\n    tailcat: pw1\n    all: pw2\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("both known users must load: %v", err)
+	}
+	if len(cfg.Socks.Users) != 2 {
+		t.Errorf("users = %v, want tailcat and all", cfg.Socks.Users)
+	}
+}
