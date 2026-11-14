@@ -51,6 +51,7 @@ input.txt { background: #12141a; color: #d8dce6; border: 1px solid #343a46; bord
   <h1>tailcat-socks</h1>
   <nav class="tabs">
     <button id="tab-conn" class="active">当前连接</button>
+    <button id="tab-history">历史连接</button>
     <button id="tab-dns">DNS 配置</button>
   </nav>
   <span id="status">加载中…</span>
@@ -71,6 +72,28 @@ input.txt { background: #12141a; color: #d8dce6; border: 1px solid #343a46; bord
       </tr></thead>
       <tbody id="conn-body"><tr><td colspan="11" class="muted">加载中…</td></tr></tbody>
     </table>
+  </section>
+  <section id="view-history" hidden>
+    <div class="bar" style="margin-top:0;margin-bottom:12px">
+      <label for="history-date" class="muted">日期</label>
+      <input type="date" id="history-date" class="txt" style="width:180px">
+    </div>
+    <div class="cards">
+      <div class="card"><div class="k">条目数</div><div class="v" id="hist-entries">–</div></div>
+      <div class="card"><div class="k">总次数</div><div class="v" id="hist-count">–</div></div>
+      <div class="card"><div class="k">失败次数</div><div class="v" id="hist-failures">–</div></div>
+      <div class="card"><div class="k">上行</div><div class="v" id="hist-up">–</div></div>
+      <div class="card"><div class="k">下行</div><div class="v" id="hist-down">–</div></div>
+      <div class="card"><div class="k">总流量</div><div class="v" id="hist-total">–</div></div>
+    </div>
+    <table>
+      <thead><tr>
+        <th>客户端 IP</th><th>域名</th><th>端口</th><th>次数</th><th>失败</th>
+        <th>↑ 字节</th><th>↓ 字节</th><th>总流量</th>
+      </tr></thead>
+      <tbody id="hist-body"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
+    </table>
+    <div id="hist-msg" class="msg"></div>
   </section>
   <section id="view-dns" hidden>
     <p class="muted" id="dns-path"></p>
@@ -111,14 +134,79 @@ const fmtDur = (ms) => {
   return Math.floor(s / 3600) + "h" + Math.floor((s % 3600) / 60) + "m";
 };
 
+// ---- 历史连接：单日查询，不轮询 ----
+// 历史只在连接结束时变化，没有实时性要求；切标签或改日期时拉一次即可。
+// 与当前连接不同，这里刻意不挂 setInterval——每分钟一次的轮询只会白烧
+// 一次 SQLite 全表扫描。
+function todayStr() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
+async function loadHistory() {
+  const dateEl = $("history-date");
+  if (!dateEl.value) dateEl.value = todayStr();
+  const body = $("hist-body");
+  const msg = $("hist-msg");
+  msg.textContent = "";
+  try {
+    const r = await fetch("/api/history?date=" + encodeURIComponent(dateEl.value), {cache: "no-store"});
+    const doc = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      msg.className = "msg err";
+      msg.textContent = "读取失败: " + (doc.error || ("HTTP " + r.status));
+      return;
+    }
+    if (!doc.enabled) {
+      body.innerHTML = '<tr><td colspan="8" class="muted">历史记录未启用（config.yaml: history.enabled）</td></tr>';
+      for (const id of ["hist-entries", "hist-count", "hist-failures", "hist-up", "hist-down", "hist-total"]) {
+        $(id).textContent = "–";
+      }
+      return;
+    }
+    const t = doc.totals || {};
+    $("hist-entries").textContent = t.entries || 0;
+    $("hist-count").textContent = t.count || 0;
+    $("hist-failures").textContent = t.failures || 0;
+    $("hist-up").textContent = fmtBytes(t.bytesUp || 0);
+    $("hist-down").textContent = fmtBytes(t.bytesDown || 0);
+    $("hist-total").textContent = fmtBytes(t.totalBytes || 0);
+    // 服务端已按累计流量倒序，这里不再排序。
+    const rows = (doc.entries || []).map((e) => {
+      const failCell = e.failures > 0
+        ? '<td style="color:#ff7b72">' + e.failures + "</td>"
+        : "<td>0</td>";
+      return "<tr><td class=\"muted\">" + esc(e.clientIp) +
+        "</td><td>" + esc(e.host) +
+        "</td><td>" + e.port +
+        "</td><td>" + e.count +
+        "</td>" + failCell +
+        "<td>" + fmtBytes(e.bytesUp) +
+        "</td><td>" + fmtBytes(e.bytesDown) +
+        "</td><td>" + fmtBytes(e.totalBytes) + "</td></tr>";
+    });
+    body.innerHTML = rows.length ? rows.join("") : '<tr><td colspan="8" class="muted">该日暂无记录</td></tr>';
+  } catch (e) {
+    msg.className = "msg err";
+    msg.textContent = "读取失败: " + e.message;
+  }
+}
+
+$("history-date").value = todayStr();
+$("history-date").onchange = loadHistory;
+
 // ---- Tab 切换 ----
 function showTab(name) {
   $("tab-conn").classList.toggle("active", name === "tab-conn");
+  $("tab-history").classList.toggle("active", name === "tab-history");
   $("tab-dns").classList.toggle("active", name === "tab-dns");
   $("view-conn").hidden = name !== "tab-conn";
+  $("view-history").hidden = name !== "tab-history";
   $("view-dns").hidden = name !== "tab-dns";
 }
 $("tab-conn").onclick = () => showTab("tab-conn");
+$("tab-history").onclick = () => { showTab("tab-history"); loadHistory(); };
 $("tab-dns").onclick = () => { showTab("tab-dns"); loadDns(); };
 
 // ---- 当前连接：1s 轮询，速率 = 相邻两次采样差（spec §6） ----

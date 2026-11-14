@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 )
 
 // Admin 承载管理页的 HTTP API（spec §8）。页面路由 "/" 在 Task 6 注册，
@@ -14,11 +15,18 @@ type Admin struct {
 	registry *ConnRegistry
 	dnsMap   *DNSMap
 	dnsPath  string
+	// history 为 nil 表示历史功能未启用（配置关掉或数据库打不开），
+	// /api/history 会如实返回 enabled=false。
+	history *History
 }
 
 func NewAdmin(registry *ConnRegistry, dnsMap *DNSMap, dnsPath string) *Admin {
 	return &Admin{registry: registry, dnsMap: dnsMap, dnsPath: dnsPath}
 }
+
+// SetHistory 挂上历史库。单独一个 setter 而不是改 NewAdmin 签名：NewAdmin
+// 已被多处测试与调用方使用，加参数会让每个不需要历史的场景都传 nil。
+func (a *Admin) SetHistory(h *History) { a.history = h }
 
 //go:embed static/index.html
 var staticIndexHTML string // 编译期打进二进制；单个嵌入模式允许直接嵌进 string
@@ -29,6 +37,7 @@ func (a *Admin) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", a.handleIndex)
 	mux.HandleFunc("GET /api/connections", a.handleConnections)
+	mux.HandleFunc("GET /api/history", a.handleHistory)
 	mux.HandleFunc("GET /api/dns", a.handleGetDNS)
 	mux.HandleFunc("PUT /api/dns", a.handlePutDNS)
 	return mux
@@ -65,6 +74,41 @@ type connJSON struct {
 type connectionsDoc struct {
 	Active []connJSON `json:"active"`
 	Totals Totals     `json:"totals"`
+}
+
+// historyDoc 是 /api/history 的响应体。Entries 永远是非 nil 切片（即使为空），
+// 页面才能无条件 for-of；disabled 时也给出空数组而不是 null。
+type historyDoc struct {
+	Enabled bool           `json:"enabled"`
+	Date    string         `json:"date"`
+	Totals  HistoryTotals  `json:"totals"`
+	Entries []HistoryEntry `json:"entries"`
+}
+
+// handleHistory 返回某一天的聚合历史。date 缺省为今天；格式必须是
+// YYYY-MM-DD，否则 400——不做"猜你意思"的宽容解析，因为把 11-14-2026
+// 当成别的日子只会让人以为数据丢了。
+func (a *Admin) handleHistory(w http.ResponseWriter, r *http.Request) {
+	day := r.URL.Query().Get("date")
+	if day == "" {
+		day = time.Now().Format("2006-01-02")
+	} else if _, err := time.Parse("2006-01-02", day); err != nil {
+		httpError(w, http.StatusBadRequest, "date 需为 YYYY-MM-DD")
+		return
+	}
+	doc := historyDoc{Enabled: a.history != nil, Date: day, Entries: []HistoryEntry{}}
+	if a.history != nil {
+		entries, totals, err := a.history.Query(day)
+		if err != nil {
+			httpError(w, http.StatusInternalServerError, "读取历史失败: "+err.Error())
+			return
+		}
+		if entries != nil {
+			doc.Entries = entries
+		}
+		doc.Totals = totals
+	}
+	writeJSON(w, http.StatusOK, doc)
 }
 
 func (a *Admin) handleIndex(w http.ResponseWriter, r *http.Request) {

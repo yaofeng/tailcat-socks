@@ -295,3 +295,118 @@ func TestHandleIndexServesEmbeddedPage(t *testing.T) {
 		}
 	}
 }
+
+// clientHistoryDoc 是 /api/history 的测试侧解码镜像。与 admin.go 的
+// historyDoc 分开命名：同在 package main，两个包级类型不能重名。
+type clientHistoryDoc struct {
+	Enabled bool           `json:"enabled"`
+	Date    string         `json:"date"`
+	Totals  HistoryTotals  `json:"totals"`
+	Entries []HistoryEntry `json:"entries"`
+}
+
+func TestHandleHistoryDefaultsToToday(t *testing.T) {
+	admin, _, _, _ := newAdminFixture(t)
+	h, err := OpenHistory(filepath.Join(t.TempDir(), "h.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	admin.SetHistory(h)
+
+	today := time.Now().Format("2006-01-02")
+	h.Record(today, "1.1.1.1", "a.example.com", 443, false, 10, 20)
+
+	rec := httptest.NewRecorder()
+	admin.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/history", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	var doc clientHistoryDoc
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if !doc.Enabled {
+		t.Error("enabled should be true when history is attached")
+	}
+	if doc.Date != today {
+		t.Errorf("date = %q, want %q (default should be today)", doc.Date, today)
+	}
+	if len(doc.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(doc.Entries))
+	}
+	if got := doc.Entries[0].TotalBytes; got != 30 {
+		t.Errorf("entry totalBytes = %d, want 30", got)
+	}
+	if doc.Totals.TotalBytes != 30 || doc.Totals.Count != 1 {
+		t.Errorf("totals = %+v", doc.Totals)
+	}
+}
+
+// 日期格式不做宽容解析：11-14-2026 这种必须 400，而不是被当成别的日子。
+func TestHandleHistoryRejectsBadDate(t *testing.T) {
+	admin, _, _, _ := newAdminFixture(t)
+	rec := httptest.NewRecorder()
+	admin.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/history?date=11-14-2026", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "YYYY-MM-DD") {
+		t.Errorf("error should explain the expected format, got %s", rec.Body)
+	}
+}
+
+// 历史未启用（nil）时仍要 200 + enabled:false + 空数组，页面据此显示"未启用"，
+// 而不是当成接口坏了。
+func TestHandleHistoryDisabled(t *testing.T) {
+	admin, _, _, _ := newAdminFixture(t)
+	rec := httptest.NewRecorder()
+	admin.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/history?date=2026-11-14", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var doc clientHistoryDoc
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Enabled {
+		t.Error("nil history must report enabled=false")
+	}
+	if doc.Entries == nil {
+		t.Error("entries must be [] not null, so the page can iterate unconditionally")
+	}
+	if len(doc.Entries) != 0 {
+		t.Errorf("disabled history must return no entries, got %+v", doc.Entries)
+	}
+}
+
+// 指定日期只返回该日的数据，且按累计流量倒序（服务端排序，页面不再排）。
+func TestHandleHistoryFiltersByDateAndOrders(t *testing.T) {
+	admin, _, _, _ := newAdminFixture(t)
+	h, err := OpenHistory(filepath.Join(t.TempDir(), "h.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	admin.SetHistory(h)
+
+	h.Record("2026-11-13", "9.9.9.9", "old.example.com", 443, false, 999999, 999999)
+	h.Record("2026-11-14", "small", "a.example.com", 443, false, 1, 1)
+	h.Record("2026-11-14", "big", "a.example.com", 443, false, 5000, 5000)
+
+	rec := httptest.NewRecorder()
+	admin.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/history?date=2026-11-14", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var doc clientHistoryDoc
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Entries) != 2 {
+		t.Fatalf("want only the 2 rows from 2026-11-14, got %d: %+v", len(doc.Entries), doc.Entries)
+	}
+	if doc.Entries[0].ClientIP != "big" {
+		t.Errorf("first row = %q, want big (highest traffic first)", doc.Entries[0].ClientIP)
+	}
+}
