@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Start tailcat-socks in the background.
 # Config via env (all optional):
-#   LISTEN=127.0.0.1:1080  DNS_FILE=<root>/data/dns.txt  PROXY_ARGS="extra flags"
-# The binary itself reads ADMIN_ADDR and TAILCAT_CLIENT_KEY_FILE (flag > env >
-# default), so just export them; PROXY_ARGS can also pass --admin-addr.
+#   LISTEN=127.0.0.1:1080  DATA_PATH=<root>/data  PROXY_ARGS="extra flags"
+# DATA_PATH holds dns.txt, config.yaml, tailcat-client-key and history.db.
+# The binary itself reads ADMIN_ADDR (flag > env > default), so just export it;
+# PROXY_ARGS can also pass --admin-addr.
 # PROXY_ARGS is word-split and glob-expanded by the shell (intended for
 # multiple flags); avoid spaces inside individual flag values.
 set -euo pipefail
@@ -16,7 +17,7 @@ PID_FILE="$RUN_DIR/tailcat-socks-go.pid"
 LOG_FILE="$RUN_DIR/tailcat-socks-go.log"
 
 LISTEN="${LISTEN:-127.0.0.1:1080}"
-DNS_FILE="${DNS_FILE:-$ROOT/data/dns.txt}"
+DATA_PATH="${DATA_PATH:-$ROOT/data}"
 
 mkdir -p "$RUN_DIR"
 
@@ -52,12 +53,12 @@ fi
 
 : > "$LOG_FILE"   # truncate on each fresh start
 
-ARGS=(--listen "$LISTEN" --dns-file "$DNS_FILE")
+ARGS=(--listen "$LISTEN" --data-path "$DATA_PATH")
 nohup "$BIN" "${ARGS[@]}" ${PROXY_ARGS:-} >>"$LOG_FILE" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
 
-# Bail out loudly if the proxy died immediately (bad --dns-file, port in use).
+# Bail out loudly if the proxy died immediately (bad --data-path, port in use).
 # 0.4s catches fast fails only; a later crash still leaves a stale pid file
 # for stop.sh to clean up.
 sleep 0.4

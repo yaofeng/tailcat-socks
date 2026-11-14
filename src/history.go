@@ -101,7 +101,7 @@ func historyDSN(path string) string {
 // OpenHistory 打开（必要时创建）path 处的 SQLite 库并建表。
 func OpenHistory(path string) (*History, error) {
 	if path == "" {
-		return nil, fmt.Errorf("history path is empty; set history.path in config.yaml")
+		return nil, fmt.Errorf("history path is empty; it is derived from --data-path, so this means the data directory was not resolved")
 	}
 	// SQLite 不会创建中间目录，而默认配置就是 data/history.db。不建目录时
 	// 失败会报成 "unable to open database file: out of memory (14)"——那句

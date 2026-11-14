@@ -24,8 +24,8 @@ socks:
     all: "changeme"
 
 history:
+  # 历史库固定落在 --data-path 目录下的 history.db。
   enabled: true
-  path: "data/history.db"
 `
 
 // Config 是 data/config.yaml 的映射。目前只有 SOCKS 用户与历史记录两组；
@@ -35,12 +35,11 @@ type Config struct {
 		Users map[string]string `yaml:"users"`
 	} `yaml:"socks"`
 	History struct {
+		// Enabled 只决定要不要记录历史。库的位置不在这里配：所有数据文件
+		// 统一由 --data-path 决定（config.yaml、dns.txt、client key、history.db
+		// 都放在那个目录），一个来源才不会出现"配置写相对路径、cwd 一换就
+		// 建到别处"这类事故。
 		Enabled bool `yaml:"enabled"`
-		// Path 是历史库路径，相对路径按进程工作目录解析，而不是按配置文件
-		// 所在目录——和 --dns-file / --client-key-file 保持同一个约定，不能
-		// 让配置项各有一套解析规则。容器部署请写绝对路径，并落在挂载卷里，
-		// 否则 db 会跟着容器一起消失。
-		Path string `yaml:"path"`
 	} `yaml:"history"`
 }
 

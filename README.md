@@ -63,6 +63,8 @@ $EDITOR data/config.yaml
 (cd src && go build -ldflags="-X main.version=$(cat ../.version)" -o ../bin/tailcat-socks .)
 
 # 前台运行:SOCKS5 127.0.0.1:1080,管理页 http://127.0.0.1:8080/
+# 默认从 ./data 读取 dns.txt / config.yaml / tailcat-client-key,并把
+# history.db 也写在同一个目录。
 bin/tailcat-socks
 
 # 用起来(必须带凭据)
@@ -77,15 +79,27 @@ export all_proxy=socks5h://tailcat:你的密码@127.0.0.1:1080
 | 参数 | 默认 | 环境变量回退 | 说明 |
 |---|---|---|---|
 | `--listen` | `127.0.0.1:1080` | – | 面向客户端的 SOCKS5 监听地址 |
-| `--dns-file` | `data/dns.txt` | – | 域名→token 映射文件 |
-| `--config` | `data/config.yaml` | – | 配置文件;不存在时自动生成默认模板 |
-| `--client-key-file` | `data/tailcat-client-key` | `TAILCAT_CLIENT_KEY_FILE` | tailcat 客户端身份文件(JSON) |
+| `--data-path` | `data` | – | 数据目录;下面的文件都从它读,见「数据目录」 |
 | `--admin-addr` | `127.0.0.1:8080` | `ADMIN_ADDR` | 管理页/API 监听地址;**空串完全禁用** |
-| `--no-watch` | 关 | – | 关闭 dns.txt 热加载 |
 | `--log-level` | `info` | – | 日志级别:`debug` / `info` / `warn` / `error`。**注意**:`debug` 会产生大量 tailscale 内部日志,输出到终端时会拖慢数据路径(实测吞吐从 ~2 MB/s 掉到 ~17 KB/s),排查时请重定向到文件 |
 | `--version` | – | – | 打印版本号后退出 |
 
 优先级:**命令行 > 环境变量 > 默认值**。env 只在对应 flag 未显式给出时生效;把 env 设为空串也算"已设置"(用于 `ADMIN_ADDR=""` 禁用页面)。
+
+### 数据目录(`--data-path`)
+
+所有需要读取/写入的文件都固定放在同一个目录里,不再为每个文件单开一个参数:
+
+| 文件 | 说明 |
+|---|---|
+| `dns.txt` | 域名→token 映射,热加载 |
+| `config.yaml` | 认证用户与历史开关;不存在时自动生成模板 |
+| `tailcat-client-key` | tailcat 客户端身份(JSON),首启自动生成 |
+| `history.db` | SQLite 历史聚合库,自动创建 |
+
+路径会被解析成**绝对路径**后再使用,所以进程工作目录怎么变都不影响:早先每个文件一个 flag 时,一旦换个目录启动,就会出现一半文件读旧位置、一半写新位置,历史库还会悄悄建到别处。
+
+`--data-path` 不存在的子目录会被自动创建(历史库的父目录由 `OpenHistory` 负责)。
 
 ### 版本号
 
@@ -111,7 +125,7 @@ bin/tailcat-socks --version    # 0.9.0
 TS_DEBUG_ALWAYS_USE_DERP=0 bin/tailcat-socks
 ```
 
-## 配置(data/config.yaml)
+## 配置(`<data-path>/config.yaml`)
 
 首次启动时若文件不存在会**自动生成**一份模板并打 WARN。模板里的密码是占位的
 `changeme`,**暴露到网络前务必修改**。文件含明文密码,权限应为 0600,已被 git
@@ -124,15 +138,14 @@ socks:
     all: "changeme"          # 可访问任意目标
 
 history:
-  enabled: true
-  path: "data/history.db"    # 相对路径按进程工作目录解析
+  enabled: true              # 历史库固定为 <data-path>/history.db
 ```
 
 - `socks.users` 是**强制项**:为空、用户名为空、密码为空或空白、用户名不是
   `tailcat` / `all` 之一,都会让启动失败并给出具体原因。用户名决定授权范围,
   所以拼错的名字不能静默通过。
-- `history.path` 的相对路径按**进程工作目录**解析(与 `--dns-file` 一致)。
-  容器部署请写绝对路径并落在挂载卷里。
+- 历史库的位置不在这里配:所有文件统一由 `--data-path` 决定。写了 `history.path`
+  会被 `KnownFields` 拒绝,而不是被静默忽略。
 
 ## SOCKS5 认证
 
@@ -185,7 +198,7 @@ tail -f run/tailcat-socks-go.log
 
 脚本只停止确属本代理的进程(校验 /proc pid 归属);start 后若进程秒退(如 dns 文件不存在、端口被占)会直接报错并以非零码退出,并打印日志尾部。
 
-脚本自身认的环境变量:`LISTEN`、`DNS_FILE`、`PROXY_ARGS`(经 shell 分词,适合放多个额外 flag);`ADMIN_ADDR`、`TAILCAT_CLIENT_KEY_FILE` 由二进制直接读取。例:`LISTEN=127.0.0.1:1080 ADMIN_ADDR=127.0.0.1:8080 bin/start.sh`
+脚本自身认的环境变量:`LISTEN`、`DATA_PATH`、`PROXY_ARGS`(经 shell 分词,适合放多个额外 flag);`ADMIN_ADDR` 由二进制直接读取。例:`LISTEN=127.0.0.1:1080 ADMIN_ADDR=127.0.0.1:8080 bin/start.sh`
 
 ## Docker
 
@@ -196,7 +209,8 @@ docker compose logs -f
 docker compose down
 ```
 
-- compose 把仓库根目录只读挂进容器 `/app/config`,`DNS_FILE=/app/config/data/dns.txt`。改宿主机 `data/dns.txt` 即热加载(挂目录而非单文件,规避编辑器 rename 换 inode 导致的热加载失效)。
+- compose 把仓库的 `data/` 目录挂进容器 `/data`(`DATA_PATH=/data`),dns.txt、config.yaml、client key、history.db 都在那里。改宿主机 `data/dns.txt` 即热加载(挂目录而非单文件,规避编辑器 rename 换 inode 导致的热加载失效)。
+- 管理页端口映射到宿主机**回环地址**(`127.0.0.1:8080:8080`)——页面无鉴权,只让本机访问。要对网络开放请自行加反代或防火墙,并改映射为 `8080:8080`。
 - 容器内 `LISTEN=0.0.0.0:1080`;管理页默认 `127.0.0.1:8080`(**容器内**,宿主机访问不到)。要开放:同时取消 `ADMIN_ADDR: "0.0.0.0:8080"` 与 `8080:8080` 端口映射的注释——注意这等于把无鉴权页面暴露给宿主机网络。
 - tailcat 客户端身份存在命名卷 `tailcat-client-key:/data`,容器重建不丢身份。
 - 容器需能出网(DERP/STUN)。
@@ -205,7 +219,7 @@ docker compose down
 
 ## dns.txt 热加载
 
-代理监听 `dns.txt` 变化即重新载入(原子替换内存映射):用 fsnotify 文件事件,并在每次 Create/Write 后重新挂载 watch(规避原子保存换 inode)。读取失败时保留旧映射并打警告。改完文件存盘即生效,无需重启;`--no-watch` 关闭。管理页保存走的是"写完立即重载"路径,不受 50ms 防抖影响;与外部编辑器并发是 last-writer-wins。
+代理监听 `dns.txt` 变化即重新载入(原子替换内存映射):用 fsnotify 文件事件,并在每次 Create/Write 后重新挂载 watch(规避原子保存换 inode)。读取失败时保留旧映射并打警告。改完文件存盘即生效,无需重启(热加载始终开启)。管理页保存走的是"写完立即重载"路径,不受 50ms 防抖影响;与外部编辑器并发是 last-writer-wins。
 
 ## 目录结构
 

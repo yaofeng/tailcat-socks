@@ -21,9 +21,7 @@ RUN go mod download
 COPY src/ ./
 RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/tailcat-socks .
 
-# ---- runtime stage ----
-# Alpine, not debian-slim: the binary is fully static (CGO off), so the
-# 116MB glibc base buys nothing; alpine's sh keeps the env-expanding CMD intact.
+# ALPINE runtime keeps the image small; the binary is fully static (CGO off).
 FROM alpine:3.22
 
 RUN apk add --no-cache ca-certificates
@@ -31,27 +29,23 @@ RUN apk add --no-cache ca-certificates
 COPY --from=build /out/tailcat-socks /usr/local/bin/tailcat-socks
 
 WORKDIR /app
-# dns.txt holds real tokens and is git-ignored; bake the examples as build
-# fallbacks so the image starts on its own (compose mounts the real data/
-# over /data at runtime).
-COPY data/dns.txt.example /app/dns.txt
-# config.yaml holds plaintext passwords, so only the example ships in the
-# image. Without it the proxy would generate a file with placeholder
-# "changeme" passwords inside the container — a baked example at least makes
-# the defaults visible in the image.
-COPY data/config.yaml.example /app/config.yaml
+# dns.txt and config.yaml hold real tokens and plaintext passwords and are
+# git-ignored; bake the examples into the data dir as a build fallback so the
+# container starts on its own. compose mounts the real data over /data.
+RUN mkdir -p /data
+COPY data/dns.txt.example /data/dns.txt
+COPY data/config.yaml.example /data/config.yaml
 
 ENV LISTEN=0.0.0.0:1080 \
-    DNS_FILE=/app/dns.txt \
-    CONFIG_FILE=/app/config.yaml \
-    TAILCAT_CLIENT_KEY_FILE=/data/tailcat-client-key \
-    ADMIN_ADDR=127.0.0.1:8080
+    ADMIN_ADDR=127.0.0.1:8080 \
+    DATA_PATH=/data
 
-# 1080 = SOCKS5 to clients. Admin stays container-internal (127.0.0.1) unless
-# you deliberately expose it; see docker-compose.yml.
+# dns.txt, config.yaml and the client key all come from DATA_PATH; the image
+# only bakes example files as a build fallback so it can start on its own.
+# compose mounts the real data directory over /data at runtime.
 EXPOSE 1080
 VOLUME ["/data"]
 
 # exec so PID 1 forwards signals -> proxy runs its shutdown order
 # (SOCKS listener, relays, admin Shutdown(1s), tailcat clients).
-CMD ["sh", "-c", "exec tailcat-socks --listen \"$LISTEN\" --dns-file \"$DNS_FILE\" --config \"$CONFIG_FILE\" --client-key-file \"$TAILCAT_CLIENT_KEY_FILE\" --admin-addr \"$ADMIN_ADDR\""]
+CMD ["sh", "-c", "exec tailcat-socks --listen \"$LISTEN\" --admin-addr \"$ADMIN_ADDR\" --data-path \"$DATA_PATH\""]

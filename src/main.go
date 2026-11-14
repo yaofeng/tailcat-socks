@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -24,16 +25,41 @@ import (
 // 保持 "dev"，不猜版本。
 var version = "dev"
 
+// dataFiles 是把 --data-path 展开成的那一组固定文件名。所有需要持久化的
+// 东西都从这一个目录里取，不再为每个文件单开一个 flag：路径全部相对 cwd
+// 时，一旦换个目录启动就会一半文件读旧位置、一半写新位置，历史更是会悄悄
+// 建到别处。一个 --data-path 定死全部。
+type dataFiles struct {
+	dir       string
+	dns       string
+	config    string
+	clientKey string
+	history   string
+}
+
+// newDataFiles 把目录展开成各文件的绝对路径。绝对路径是刻意的：后面所有
+// 读写都以它为基准，不再受进程 cwd 影响。
+func newDataFiles(dir string) (dataFiles, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return dataFiles{}, fmt.Errorf("resolve --data-path %q: %w", dir, err)
+	}
+	return dataFiles{
+		dir:       abs,
+		dns:       filepath.Join(abs, "dns.txt"),
+		config:    filepath.Join(abs, "config.yaml"),
+		clientKey: filepath.Join(abs, "tailcat-client-key"),
+		history:   filepath.Join(abs, "history.db"),
+	}, nil
+}
+
 func main() {
 	var (
-		listen        = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address (host:port; empty host binds all interfaces)")
-		dnsFile       = flag.String("dns-file", "data/dns.txt", "domain->token mapping file")
-		configFile    = flag.String("config", "data/config.yaml", "config file (created with defaults if missing)")
-		clientKeyFile = flag.String("client-key-file", "data/tailcat-client-key", "persistent tailcat client identity (JSON)")
-		adminAddr     = flag.String("admin-addr", "127.0.0.1:8080", "admin page/API address (host:port; empty disables)")
-		noWatch       = flag.Bool("no-watch", false, "disable dns.txt hot-reload")
-		logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, error")
-		showVersion   = flag.Bool("version", false, "print version and exit")
+		listen      = flag.String("listen", "0.0.0.0:1080", "SOCKS5 listen address (host:port; empty host binds all interfaces)")
+		adminAddr   = flag.String("admin-addr", "127.0.0.1:8080", "admin page/API address (host:port; empty disables)")
+		dataPath    = flag.String("data-path", "data", "directory holding dns.txt, config.yaml, tailcat-client-key and history.db")
+		logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 	if *showVersion {
@@ -45,20 +71,21 @@ func main() {
 		lvl = slog.LevelInfo
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})).With("component", "tailcat-socks"))
+	files, err := newDataFiles(*dataPath)
+	if err != nil {
+		slog.Error("bad --data-path", "value", *dataPath, "err", err)
+		os.Exit(1)
+	}
 	// flag.Visit reports only flags actually set on the command line, so an
 	// explicit flag keeps priority even when its value equals the default.
-	// Env fallbacks: TAILCAT_CLIENT_KEY_FILE, ADMIN_ADDR ("" disables),
-	// CONFIG_FILE.
+	// Env fallback: ADMIN_ADDR ("" disables).
 	explicit := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
-	os.Exit(run(*listen, *dnsFile,
-		resolveSetting(explicit["config"], "CONFIG_FILE", *configFile),
-		resolveSetting(explicit["client-key-file"], "TAILCAT_CLIENT_KEY_FILE", *clientKeyFile),
-		resolveSetting(explicit["admin-addr"], "ADMIN_ADDR", *adminAddr),
-		*noWatch))
+	os.Exit(run(*listen, files,
+		resolveSetting(explicit["admin-addr"], "ADMIN_ADDR", *adminAddr)))
 }
 
-func run(listen, dnsFile, configFile, clientKeyFile, adminAddr string, noWatch bool) int {
+func run(listen string, files dataFiles, adminAddr string) int {
 	// Install the signal handler before doing anything else: stopNotify is
 	// deferred FIRST so it runs LAST — the handler stays installed until
 	// run() actually returns, so a repeat Ctrl-C during shutdown is
@@ -69,9 +96,9 @@ func run(listen, dnsFile, configFile, clientKeyFile, adminAddr string, noWatch b
 	ctx, cancel := context.WithCancel(notifyCtx)
 	defer cancel()
 
-	first, err := LoadDNSFile(dnsFile)
+	first, err := LoadDNSFile(files.dns)
 	if err != nil {
-		slog.Error("cannot load dns file", "path", dnsFile, "err", err)
+		slog.Error("cannot load dns file", "path", files.dns, "err", err)
 		return 1
 	}
 	dnsMap := &DNSMap{}
@@ -79,9 +106,9 @@ func run(listen, dnsFile, configFile, clientKeyFile, adminAddr string, noWatch b
 
 	// 认证是强制项，配置必须在监听之前就位：解析失败或用户表不合法时
 	// 直接退出，不能先开端口再发现没人能连。
-	cfg, err := LoadConfig(configFile)
+	cfg, err := LoadConfig(files.config)
 	if err != nil {
-		slog.Error("cannot load config", "path", configFile, "err", err)
+		slog.Error("cannot load config", "path", files.config, "err", err)
 		return 1
 	}
 	users := make(Users, len(cfg.Socks.Users))
@@ -90,18 +117,20 @@ func run(listen, dnsFile, configFile, clientKeyFile, adminAddr string, noWatch b
 		// 授权范围不允许"猜一个默认值"。
 		mode, merr := modeForUser(name)
 		if merr != nil {
-			slog.Error("bad config", "path", configFile, "err", merr)
+			slog.Error("bad config", "path", files.config, "err", merr)
 			return 1
 		}
 		users[name] = User{password: pw, Mode: mode}
 	}
 
 	// 历史是旁路功能：打不开就降级为不可用并继续服务，绝不因此拒绝启动。
+	// 库的位置由 --data-path 决定，不读配置：路径只该有一个来源，否则
+	// config.yaml 里写相对路径又会按 cwd 解析到别处。
 	var history *History
 	if cfg.History.Enabled {
-		history, err = OpenHistory(cfg.History.Path)
+		history, err = OpenHistory(files.history)
 		if err != nil {
-			slog.Warn("history disabled: cannot open database", "path", cfg.History.Path, "err", err)
+			slog.Warn("history disabled: cannot open database", "path", files.history, "err", err)
 			history = nil
 		}
 	}
@@ -130,7 +159,7 @@ func run(listen, dnsFile, configFile, clientKeyFile, adminAddr string, noWatch b
 	// The client key cannot break startup: a corrupt or unwritable file only
 	// WARNs and falls back to an ephemeral identity (dialer.go), never
 	// clobbers the file.
-	dialer := NewAppDialer(clientKeyFile)
+	dialer := NewAppDialer(files.clientKey)
 	registry := NewConnRegistry()
 	srv, err := NewServerWithUsers(dnsMap, dialer, registry, listen, users, history)
 	if err != nil {
@@ -143,7 +172,7 @@ func run(listen, dnsFile, configFile, clientKeyFile, adminAddr string, noWatch b
 	// and silently running without the page is worse.
 	var adminSrv *http.Server
 	if adminAddr != "" {
-		api := NewAdmin(registry, dnsMap, dnsFile)
+		api := NewAdmin(registry, dnsMap, files.dns)
 		api.SetHistory(history)
 		adminLn, err := net.Listen("tcp", adminAddr)
 		if err != nil {
@@ -160,9 +189,9 @@ func run(listen, dnsFile, configFile, clientKeyFile, adminAddr string, noWatch b
 		slog.Info("admin listening", "url", "http://"+adminAddr+"/")
 	}
 
-	if !noWatch {
-		go WatchDNSFile(ctx, dnsFile, dnsMap)
-	}
+	// dns.txt 的热加载不再可关（--no-watch 已删除）：它是这个代理的核心
+	// 交互，"改了文件不生效"只会被当成 bug。
+	go WatchDNSFile(ctx, files.dns, dnsMap)
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()

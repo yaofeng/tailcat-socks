@@ -18,7 +18,6 @@ func TestLoadConfigParsesUsersAndHistory(t *testing.T) {
     all: "pw2"
 history:
   enabled: true
-  path: "` + filepath.Join(dir, "h.db") + `"
 `
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -36,8 +35,22 @@ history:
 	if !cfg.History.Enabled {
 		t.Error("history.enabled should be true")
 	}
-	if cfg.History.Path != filepath.Join(dir, "h.db") {
-		t.Errorf("history.path = %q", cfg.History.Path)
+}
+
+// history.path 已从 schema 移除：库的位置统一由 --data-path 决定。配置里
+// 还写着 path 时必须报错（KnownFields），而不是被静默忽略、让人以为生效了。
+func TestLoadConfigRejectsHistoryPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "socks:\n  users:\n    tailcat: pw\nhistory:\n  enabled: true\n  path: /tmp/x.db\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("history.path is no longer part of the schema and must be rejected")
+	}
+	if !strings.Contains(err.Error(), "path") {
+		t.Errorf("error should name the offending key, got %v", err)
 	}
 }
 
