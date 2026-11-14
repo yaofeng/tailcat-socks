@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tailscale/tailcat"
+	"tailscale.com/envknob"
 	"tailscale.com/types/key"
 )
 
@@ -28,7 +29,37 @@ const (
 	// 同样脱离调用方 ctx 另挂 15s（cmd/tailcat/tailcat.go 的 socks dialer），
 	// 理由照搬：客户端侧的 deadline 不该掐断握手重传。
 	dialTimeout = 15 * time.Second
+
+	// derpOnlyEnv 是 tailscale 的 magicsock 开关：非空且为真值时禁用 UDP，
+	// 所有对端流量强制走 DERP 中继。见 pinDERPDefault。
+	derpOnlyEnv = "TS_DEBUG_ALWAYS_USE_DERP"
 )
+
+// pinDERPDefault 默认强制隧道走 DERP 中继，除非用户自己设了该环境变量。
+//
+// 为什么默认强制：本机有 9 个本地接口（bond0 + docker0 + br-* + cali* +
+// flannel.1），magicsock 会把它们全部上报成 candidate endpoint。实测
+// （2026-11-14，a100-2-01.yidong.tail）打洞成功后 magicsock 会把路径从
+// DERP "升级"成直连，而这条直连只有 ~17 KB/s，同一 token 走 DERP 中继
+// 则是 1.4–2.7 MB/s——一旦升级就再也不回落，吞吐永久塌陷。首次拨号
+// （在打洞完成之前）总是走 DERP，所以表现为"第一次快、之后全慢"。
+//
+// 代价：放弃直连可能带来的更低 RTT。对 SOCKS 代理的批量传输场景，
+// 稳定的 2 MB/s 远胜于偶尔打通的 17 KB/s。
+//
+// 必须在任何 tailscale 包代码读取该 envknob 之前执行。envknob 在
+// RegisterBool 首次调用时就把 os.Getenv 的结果固化进一个内部指针
+// （envknob.go:165-176），此后 os.Setenv 一律无效；能改写该指针的只有
+// envknob.Setenv（同文件 :94）。所以这里必须走 envknob.Setenv，而不是
+// os.Setenv——后者实测无论放在 main 还是本包 init 都不生效。
+func pinDERPDefault() {
+	if _, ok := os.LookupEnv(derpOnlyEnv); ok {
+		return // 用户显式设置（含空串/0/false），尊重之
+	}
+	envknob.Setenv(derpOnlyEnv, "1")
+}
+
+func init() { pinDERPDefault() }
 
 // Target 是一条路由决策的结果：如何抵达 host:port。
 type Target struct {

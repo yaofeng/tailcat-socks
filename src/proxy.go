@@ -180,7 +180,7 @@ func (s *Server) serveConn(client net.Conn) {
 	// it.
 	client.SetDeadline(time.Now().Add(s.handshakeTimeout))
 	if err != nil {
-		slog.Debug("dial failed", "via", target.Via, "host", host, "err", err)
+		slog.Warn("dial failed", "via", target.Via, "host", host, "port", target.Port, "err", err)
 		socksFail(client) // 未 MarkOpen：失败的会话不进 sessionsTotal
 		return
 	}

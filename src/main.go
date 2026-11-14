@@ -11,25 +11,51 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 )
 
+// version 由构建时的 -ldflags "-X main.version=..." 注入；版本号本身只
+// 存在于仓库根的 .version 文件（CI 从那里读并传进来）。直接 go build 时
+// 保持 "dev"，不猜版本。
+var version = "dev"
+
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)).With("component", "tailcat-socks"))
 	var (
 		listen        = flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address (host:port; empty host binds all interfaces)")
 		dnsFile       = flag.String("dns-file", "data/dns.txt", "domain->token mapping file")
 		clientKeyFile = flag.String("client-key-file", "data/tailcat-client-key", "persistent tailcat client identity (JSON)")
+		adminAddr     = flag.String("admin-addr", "127.0.0.1:8080", "admin page/API address (host:port; empty disables)")
 		noWatch       = flag.Bool("no-watch", false, "disable dns.txt hot-reload")
+		logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		showVersion   = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
-	os.Exit(run(*listen, *dnsFile, *clientKeyFile, *noWatch))
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(*logLevel)); err != nil {
+		lvl = slog.LevelInfo
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})).With("component", "tailcat-socks"))
+	// flag.Visit reports only flags actually set on the command line, so an
+	// explicit flag keeps priority even when its value equals the default.
+	// Env fallbacks: TAILCAT_CLIENT_KEY_FILE, ADMIN_ADDR ("" disables).
+	explicit := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	os.Exit(run(*listen, *dnsFile,
+		resolveSetting(explicit["client-key-file"], "TAILCAT_CLIENT_KEY_FILE", *clientKeyFile),
+		resolveSetting(explicit["admin-addr"], "ADMIN_ADDR", *adminAddr),
+		*noWatch))
 }
 
-func run(listen, dnsFile, clientKeyFile string, noWatch bool) int {
+func run(listen, dnsFile, clientKeyFile, adminAddr string, noWatch bool) int {
 	// Install the signal handler before doing anything else: stopNotify is
 	// deferred FIRST so it runs LAST — the handler stays installed until
 	// run() actually returns, so a repeat Ctrl-C during shutdown is
@@ -77,6 +103,27 @@ func run(listen, dnsFile, clientKeyFile string, noWatch bool) int {
 		return 1
 	}
 
+	// Admin page (spec §8): an empty addr disables it entirely; a failed
+	// bind is fail-fast — a dead admin means the config/deploy is broken,
+	// and silently running without the page is worse.
+	var adminSrv *http.Server
+	if adminAddr != "" {
+		api := NewAdmin(registry, dnsMap, dnsFile)
+		adminLn, err := net.Listen("tcp", adminAddr)
+		if err != nil {
+			slog.Error("cannot listen admin", "addr", adminAddr, "err", err)
+			srv.Close()
+			return 1
+		}
+		adminSrv = &http.Server{Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := adminSrv.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("admin server error", "err", err)
+			}
+		}()
+		slog.Info("admin listening", "url", "http://"+adminAddr+"/")
+	}
+
 	if !noWatch {
 		go WatchDNSFile(ctx, dnsFile, dnsMap)
 	}
@@ -101,8 +148,31 @@ func run(listen, dnsFile, clientKeyFile string, noWatch bool) int {
 			code = 1
 		}
 	}
-	cancel()       // stops the dns watcher
-	srv.Close()    // stop accepting; in-flight relays end on their own
+	cancel()    // stops the dns watcher
+	srv.Close() // stop accepting; in-flight relays end on their own
+	if adminSrv != nil {
+		// Graceful: finish in-flight requests, hard-stop after 1s
+		// (spec §10). context.Background: notifyCtx is already canceled.
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), time.Second)
+		defer shutCancel()
+		if err := adminSrv.Shutdown(shutCtx); err != nil {
+			slog.Error("admin shutdown", "err", err)
+		}
+	}
 	dialer.Close() // tailcat clients go last (spec §10 shutdown order)
 	return code
+}
+
+// resolveSetting implements the flag > env > default precedence used by
+// every env-configurable knob. `explicit` comes from flag.Visit, so a flag
+// set to its default value on the command line still wins; LookupEnv (not
+// Getenv) makes an empty env value count as set — ADMIN_ADDR="" disables.
+func resolveSetting(explicit bool, envName, flagVal string) string {
+	if explicit {
+		return flagVal
+	}
+	if v, ok := os.LookupEnv(envName); ok {
+		return v
+	}
+	return flagVal
 }
