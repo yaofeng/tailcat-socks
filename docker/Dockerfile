@@ -36,16 +36,14 @@ RUN mkdir -p /data
 COPY data/dns.txt.example /data/dns.txt
 COPY data/config.yaml.example /data/config.yaml
 
-ENV LISTEN=0.0.0.0:1080 \
-    ADMIN_ADDR=127.0.0.1:8080 \
-    DATA_PATH=/data
+ENV DATA_PATH=/data
 
 # dns.txt, config.yaml and the client key all come from DATA_PATH; the image
 # only bakes example files as a build fallback so it can start on its own.
 # compose mounts the real data directory over /data at runtime.
-EXPOSE 1080
+EXPOSE 1080 7890
 VOLUME ["/data"]
 
 # exec so PID 1 forwards signals -> proxy runs its shutdown order
 # (SOCKS listener, relays, admin Shutdown(1s), tailcat clients).
-CMD ["sh", "-c", "exec tailcat-proxy --listen \"$LISTEN\" --admin-addr \"$ADMIN_ADDR\" --data-path \"$DATA_PATH\""]
+CMD ["sh", "-c", "exec tailcat-proxy --data-path \"$DATA_PATH\""]

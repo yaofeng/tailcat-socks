@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 )
@@ -55,8 +54,6 @@ func newDataFiles(dir string) (dataFiles, error) {
 
 func main() {
 	var (
-		listen      = flag.String("listen", "0.0.0.0:1080", "SOCKS5 listen address (host:port; empty host binds all interfaces)")
-		adminAddr   = flag.String("admin-addr", "127.0.0.1:8080", "admin page/API address (host:port; empty disables)")
 		dataPath    = flag.String("data-path", "data", "directory holding dns.txt, config.yaml, tailcat-client-key and history.db")
 		logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		showVersion = flag.Bool("version", false, "print version and exit")
@@ -76,16 +73,10 @@ func main() {
 		slog.Error("bad --data-path", "value", *dataPath, "err", err)
 		os.Exit(1)
 	}
-	// flag.Visit reports only flags actually set on the command line, so an
-	// explicit flag keeps priority even when its value equals the default.
-	// Env fallback: ADMIN_ADDR ("" disables).
-	explicit := map[string]bool{}
-	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
-	os.Exit(run(*listen, files,
-		resolveSetting(explicit["admin-addr"], "ADMIN_ADDR", *adminAddr)))
+	os.Exit(run(files))
 }
 
-func run(listen string, files dataFiles, adminAddr string) int {
+func run(files dataFiles) int {
 	// Install the signal handler before doing anything else: stopNotify is
 	// deferred FIRST so it runs LAST — the handler stays installed until
 	// run() actually returns, so a repeat Ctrl-C during shutdown is
@@ -111,8 +102,8 @@ func run(listen string, files dataFiles, adminAddr string) int {
 		slog.Error("cannot load config", "path", files.config, "err", err)
 		return 1
 	}
-	users := make(Users, len(cfg.Socks.Users))
-	for name, pw := range cfg.Socks.Users {
+	users := make(Users, len(cfg.Users))
+	for name, pw := range cfg.Users {
 		// LoadConfig 已经校验过用户名的合法性，这里不会失败；仍检查是因为
 		// 授权范围不允许"猜一个默认值"。
 		mode, merr := modeForUser(name)
@@ -138,32 +129,41 @@ func run(listen string, files dataFiles, adminAddr string) int {
 		defer history.Close()
 	}
 
-	// Validate --listen: SplitHostPort for the host:port shape plus a numeric
-	// in-range port, so junk like "host:abc" is reported here instead of by
-	// net.Listen later. An empty host (":8080") binds every interface. The
-	// "(want host:port)" hint belongs to the shape error only, not the port.
-	lHost, lPort, err := net.SplitHostPort(listen)
-	if err != nil {
-		slog.Error("bad --listen", "value", listen, "err", fmt.Errorf("%q: %w (want host:port)", listen, err))
-		return 1
-	}
-	if p, perr := strconv.Atoi(lPort); perr != nil {
-		slog.Error("bad --listen", "value", listen, "err", fmt.Errorf("%q: %w", listen, perr))
-		return 1
-	} else if p < 0 || p > 65535 {
-		slog.Error("bad --listen", "value", listen, "err", fmt.Errorf("%q: port %d out of range", listen, p))
-		return 1
-	}
-	listen = net.JoinHostPort(lHost, lPort)
-
 	// The client key cannot break startup: a corrupt or unwritable file only
 	// WARNs and falls back to an ephemeral identity (dialer.go), never
 	// clobbers the file.
 	dialer := NewAppDialer(files.clientKey)
 	registry := NewConnRegistry()
-	srv, err := NewServerWithUsers(dnsMap, dialer, registry, listen, users, history)
-	if err != nil {
-		slog.Error("cannot listen", "addr", listen, "err", err)
+
+	// 三个入口都先绑定再启动：任一个端口被占都是部署错误，静默少起一个
+	// 入口比直接报错更糟。
+	var (
+		socksSrv  *Server
+		httpSrv   *HTTPProxy
+		haveProxy bool
+	)
+	if cfg.Listen.SOCKSProxy != "" {
+		socksSrv, err = NewServerWithUsers(dnsMap, dialer, registry, cfg.Listen.SOCKSProxy, users, history)
+		if err != nil {
+			slog.Error("cannot listen socks", "addr", cfg.Listen.SOCKSProxy, "err", err)
+			return 1
+		}
+		haveProxy = true
+	}
+	if cfg.Listen.HTTPProxy != "" {
+		httpSrv, err = NewHTTPProxy(dnsMap, dialer, registry, cfg.Listen.HTTPProxy, users, history)
+		if err != nil {
+			slog.Error("cannot listen http", "addr", cfg.Listen.HTTPProxy, "err", err)
+			if socksSrv != nil {
+				socksSrv.Close()
+			}
+			return 1
+		}
+		haveProxy = true
+	}
+	// 只有管理页的配置没有意义：没有任何代理入口等于这个进程什么都不做。
+	if !haveProxy {
+		slog.Error("no proxy entry point configured; set listen.socks-proxy and/or listen.http-proxy in config.yaml")
 		return 1
 	}
 
@@ -171,13 +171,18 @@ func run(listen string, files dataFiles, adminAddr string) int {
 	// bind is fail-fast — a dead admin means the config/deploy is broken,
 	// and silently running without the page is worse.
 	var adminSrv *http.Server
-	if adminAddr != "" {
+	if cfg.Listen.WebConsole != "" {
 		api := NewAdmin(registry, dnsMap, files.dns)
 		api.SetHistory(history)
-		adminLn, err := net.Listen("tcp", adminAddr)
+		adminLn, err := net.Listen("tcp", cfg.Listen.WebConsole)
 		if err != nil {
-			slog.Error("cannot listen admin", "addr", adminAddr, "err", err)
-			srv.Close()
+			slog.Error("cannot listen admin", "addr", cfg.Listen.WebConsole, "err", err)
+			if socksSrv != nil {
+				socksSrv.Close()
+			}
+			if httpSrv != nil {
+				httpSrv.Close()
+			}
 			return 1
 		}
 		adminSrv = &http.Server{Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
@@ -186,35 +191,46 @@ func run(listen string, files dataFiles, adminAddr string) int {
 				slog.Error("admin server error", "err", err)
 			}
 		}()
-		slog.Info("admin listening", "url", "http://"+adminAddr+"/")
+		slog.Info("admin listening", "url", "http://"+cfg.Listen.WebConsole+"/")
 	}
 
 	// dns.txt 的热加载不再可关（--no-watch 已删除）：它是这个代理的核心
 	// 交互，"改了文件不生效"只会被当成 bug。
 	go WatchDNSFile(ctx, files.dns, dnsMap)
 
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve() }()
-
-	host, port, _ := net.SplitHostPort(srv.ActualAddr().String())
-	slog.Info("listening", "url", "socks5h://"+net.JoinHostPort(host, port))
+	serveErr := make(chan error, 2)
+	if socksSrv != nil {
+		go func() { serveErr <- socksSrv.Serve() }()
+		host, port, _ := net.SplitHostPort(socksSrv.ActualAddr().String())
+		slog.Info("socks listening", "url", "socks5h://"+net.JoinHostPort(host, port))
+	}
+	if httpSrv != nil {
+		go func() { serveErr <- httpSrv.Serve() }()
+		host, port, _ := net.SplitHostPort(httpSrv.ActualAddr().String())
+		slog.Info("http listening", "url", "http://"+net.JoinHostPort(host, port))
+	}
 	slog.Info("dns map loaded", "domains", len(first), "tokens", len(tokenSet(first)))
 
 	code := 0
 	select {
 	case <-ctx.Done():
 	case err := <-serveErr:
-		// srv.Close() during shutdown makes Serve() report net.ErrClosed;
-		// that is not a real failure, so keep signal exits quiet. Any other
-		// error means the listener broke after a successful bind — that is
-		// worth a nonzero exit.
+		// Close() during shutdown makes Serve() report net.ErrClosed; that is
+		// not a real failure, so keep signal exits quiet. Any other error
+		// means a listener broke after a successful bind — that is worth a
+		// nonzero exit.
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			slog.Error("server error", "err", err)
 			code = 1
 		}
 	}
-	cancel()    // stops the dns watcher
-	srv.Close() // stop accepting; in-flight relays end on their own
+	cancel() // stops the dns watcher
+	if socksSrv != nil {
+		socksSrv.Close()
+	}
+	if httpSrv != nil {
+		httpSrv.Close()
+	}
 	if adminSrv != nil {
 		// Graceful: finish in-flight requests, hard-stop after 1s
 		// (spec §10). context.Background: notifyCtx is already canceled.
@@ -226,18 +242,4 @@ func run(listen string, files dataFiles, adminAddr string) int {
 	}
 	dialer.Close() // tailcat clients go last (spec §10 shutdown order)
 	return code
-}
-
-// resolveSetting implements the flag > env > default precedence used by
-// every env-configurable knob. `explicit` comes from flag.Visit, so a flag
-// set to its default value on the command line still wins; LookupEnv (not
-// Getenv) makes an empty env value count as set — ADMIN_ADDR="" disables.
-func resolveSetting(explicit bool, envName, flagVal string) string {
-	if explicit {
-		return flagVal
-	}
-	if v, ok := os.LookupEnv(envName); ok {
-		return v
-	}
-	return flagVal
 }

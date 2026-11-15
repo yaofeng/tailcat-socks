@@ -16,15 +16,10 @@ services:
     volumes:
       - ../data:/data
     ports:
-      - "1080:1080"                     # SOCKS5 for clients: --socks5-hostname <host>:1080
+      - "1080:1080"                     # SOCKS5
+      - "7890:7890"                     # HTTP/HTTPS CONNECT
       - "127.0.0.1:8080:8080"           # admin page, host loopback only
     environment:
-      LISTEN: "0.0.0.0:1080"            # bind all ifaces inside the container
-      # The admin page has NO authentication, so the host side of the mapping
-      # above is pinned to 127.0.0.1: only this host can reach it. To expose it
-      # to a network, change the mapping to 8080:8080 AND put a reverse proxy
-      # or firewall rule in front — the page can rewrite dns.txt.
-      ADMIN_ADDR: "0.0.0.0:8080"
       DATA_PATH: "/data"                # dns.txt + config.yaml + client key + history.db
     restart: unless-stopped
     # tailcat needs to reach DERP/STUN over the network; give it outbound access.

@@ -62,7 +62,8 @@ $EDITOR data/config.yaml
 # 构建一次(版本号来自 .version)
 (cd src && go build -ldflags="-X main.version=$(cat ../.version)" -o ../bin/tailcat-proxy .)
 
-# 前台运行:SOCKS5 127.0.0.1:1080,管理页 http://127.0.0.1:8080/
+# 前台运行:三个入口的地址见 config.yaml 的 listen 段(默认 SOCKS5
+# 0.0.0.0:1080、HTTP 0.0.0.0:7890、管理页 http://127.0.0.1:8080/)。
 # 默认从 ./data 读取 dns.txt / config.yaml / tailcat-client-key,并把
 # history.db 也写在同一个目录。
 bin/tailcat-proxy
@@ -76,15 +77,13 @@ export all_proxy=socks5h://tailcat:你的密码@127.0.0.1:1080
 
 ### 命令行参数
 
-| 参数 | 默认 | 环境变量回退 | 说明 |
-|---|---|---|---|
-| `--listen` | `127.0.0.1:1080` | – | 面向客户端的 SOCKS5 监听地址 |
-| `--data-path` | `data` | – | 数据目录;下面的文件都从它读,见「数据目录」 |
-| `--admin-addr` | `127.0.0.1:8080` | `ADMIN_ADDR` | 管理页/API 监听地址;**空串完全禁用** |
-| `--log-level` | `info` | – | 日志级别:`debug` / `info` / `warn` / `error`。**注意**:`debug` 会产生大量 tailscale 内部日志,输出到终端时会拖慢数据路径(实测吞吐从 ~2 MB/s 掉到 ~17 KB/s),排查时请重定向到文件 |
-| `--version` | – | – | 打印版本号后退出 |
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--data-path` | `data` | 数据目录;下面的文件都从它读,见「数据目录」 |
+| `--log-level` | `info` | 日志级别:`debug` / `info` / `warn` / `error`。**注意**:`debug` 会产生大量 tailscale 内部日志,输出到终端时会拖慢数据路径(实测吞吐从 ~2 MB/s 掉到 ~17 KB/s),排查时请重定向到文件 |
+| `--version` | – | 打印版本号后退出 |
 
-优先级:**命令行 > 环境变量 > 默认值**。env 只在对应 flag 未显式给出时生效;把 env 设为空串也算"已设置"(用于 `ADMIN_ADDR=""` 禁用页面)。
+监听地址不在命令行上,而是配置在 `<data-path>/config.yaml` 的 `listen:` 段,见「监听配置」。
 
 ### 数据目录(`--data-path`)
 
@@ -93,13 +92,39 @@ export all_proxy=socks5h://tailcat:你的密码@127.0.0.1:1080
 | 文件 | 说明 |
 |---|---|
 | `dns.txt` | 域名→token 映射,热加载 |
-| `config.yaml` | 认证用户与历史开关;不存在时自动生成模板 |
+| `config.yaml` | 监听地址、认证用户与历史开关;不存在时自动生成模板 |
 | `tailcat-client-key` | tailcat 客户端身份(JSON),首启自动生成 |
 | `history.db` | SQLite 历史聚合库,自动创建 |
 
 路径会被解析成**绝对路径**后再使用,所以进程工作目录怎么变都不影响:早先每个文件一个 flag 时,一旦换个目录启动,就会出现一半文件读旧位置、一半写新位置,历史库还会悄悄建到别处。
 
 `--data-path` 不存在的子目录会被自动创建(历史库的父目录由 `OpenHistory` 负责)。
+
+## 监听配置
+
+三个入口都在 `<data-path>/config.yaml` 里配置,**空串表示不监听该入口**:
+
+```yaml
+listen:
+  http-proxy: "0.0.0.0:7890"    # HTTP/HTTPS CONNECT 代理
+  socks-proxy: "0.0.0.0:1080"   # SOCKS5 代理
+  web-console: "127.0.0.1:8080" # 管理页
+```
+
+- 至少要配置一个代理入口(socks-proxy 或 http-proxy),否则启动失败。
+- 任一入口绑定失败都是 fail-fast,不会静默少起一个。
+- 地址改了需重启。
+
+## HTTP 代理
+
+```bash
+# 普通 HTTP
+curl -x http://127.0.0.1:7890 --proxy-user all:密码 http://example.com/
+# HTTPS 走 CONNECT(curl 自动处理)
+curl -x http://127.0.0.1:7890 --proxy-user all:密码 https://example.com/
+```
+
+认证与授权与 SOCKS5 完全一致:`tailcat` 用户只能访问 dns.txt 命中的域名(未命中返回 `403`),`all` 用户不限。认证失败返回 `407`,上游拨号失败返回 `502`。
 
 ### 版本号
 
@@ -108,7 +133,7 @@ export all_proxy=socks5h://tailcat:你的密码@127.0.0.1:1080
 ```bash
 # 本地构建(与镜像一致的版本号)
 (cd src && go build -ldflags="-X main.version=$(tr -d '[:space:]' < .version)" -o ../bin/tailcat-proxy .)
-bin/tailcat-proxy --version    # 0.9.0
+bin/tailcat-proxy --version    # 1.0.0
 ```
 
 直接 `go build` 不带 ldflags 时版本号是 `dev`,不会去猜。
@@ -132,16 +157,15 @@ TS_DEBUG_ALWAYS_USE_DERP=0 bin/tailcat-proxy
 忽略。配置在启动时读取一次,改完需重启。
 
 ```yaml
-socks:
-  users:
-    tailcat: "changeme"      # 只能访问 dns.txt 命中的域名(走隧道)
-    all: "changeme"          # 可访问任意目标
+users:
+  tailcat: "changeme"        # 只能访问 dns.txt 命中的域名(走隧道)
+  all: "changeme"            # 可访问任意目标
 
 history:
   enabled: true              # 历史库固定为 <data-path>/history.db
 ```
 
-- `socks.users` 是**强制项**:为空、用户名为空、密码为空或空白、用户名不是
+- `users` 是**强制项**:为空、用户名为空、密码为空或空白、用户名不是
   `tailcat` / `all` 之一,都会让启动失败并给出具体原因。用户名决定授权范围,
   所以拼错的名字不能静默通过。
 - 历史库的位置不在这里配:所有文件统一由 `--data-path` 决定。写了 `history.path`
@@ -198,20 +222,20 @@ tail -f run/tailcat-proxy-go.log
 
 脚本只停止确属本代理的进程(校验 /proc pid 归属);start 后若进程秒退(如 dns 文件不存在、端口被占)会直接报错并以非零码退出,并打印日志尾部。
 
-脚本自身认的环境变量:`LISTEN`、`DATA_PATH`、`PROXY_ARGS`(经 shell 分词,适合放多个额外 flag);`ADMIN_ADDR` 由二进制直接读取。例:`LISTEN=127.0.0.1:1080 ADMIN_ADDR=127.0.0.1:8080 bin/start.sh`
+脚本自身认的环境变量:`DATA_PATH`、`PROXY_ARGS`(经 shell 分词,适合放多个额外 flag);监听地址在 `config.yaml` 里,脚本不传。例:`DATA_PATH=/data/tailcat bin/start.sh`
 
 ## Docker
 
 ```bash
 cd docker
-docker compose up --build -d       # 构建并后台启动,暴露 1080
+docker compose up --build -d       # 构建并后台启动,暴露 1080/7890
 docker compose logs -f
 docker compose down
 ```
 
 - compose 把仓库的 `data/` 目录挂进容器 `/data`(`DATA_PATH=/data`),dns.txt、config.yaml、client key、history.db 都在那里。改宿主机 `data/dns.txt` 即热加载(挂目录而非单文件,规避编辑器 rename 换 inode 导致的热加载失效)。
-- 管理页端口映射到宿主机**回环地址**(`127.0.0.1:8080:8080`)——页面无鉴权,只让本机访问。要对网络开放请自行加反代或防火墙,并改映射为 `8080:8080`。
-- 容器内 `LISTEN=0.0.0.0:1080`;管理页默认 `127.0.0.1:8080`(**容器内**,宿主机访问不到)。要开放:同时取消 `ADMIN_ADDR: "0.0.0.0:8080"` 与 `8080:8080` 端口映射的注释——注意这等于把无鉴权页面暴露给宿主机网络。
+- 端口映射:`1080`(SOCKS5)、`7890`(HTTP/HTTPS CONNECT);管理页映射到宿主机**回环地址**(`127.0.0.1:8080:8080`)——页面无鉴权,只让本机访问。要对网络开放请自行加反代或防火墙,并改映射为 `8080:8080`。
+- 监听地址在容器内的 `<DATA_PATH>/config.yaml` 中:默认 `socks-proxy: 0.0.0.0:1080`、`http-proxy: 0.0.0.0:7890`、`web-console: 127.0.0.1:8080`。管理页默认只绑**容器内**回环,宿主机访问不到;要开放就把 `web-console` 改成 `0.0.0.0:8080`——注意这等于把无鉴权页面暴露给宿主机网络。
 - tailcat 客户端身份存在命名卷 `tailcat-client-key:/data`,容器重建不丢身份。
 - 容器需能出网(DERP/STUN)。
 - 镜像 runtime 为 `alpine:3.22`(全静态二进制不需要 glibc),**只含一个可执行文件**(tailcat 是库依赖);已发布为 `yaofeng928/tailcat-proxy:latest`。
@@ -226,11 +250,12 @@ docker compose down
 ```
 tailcat-proxy/
 ├── src/                              # Go 版(idiomatic Go;单二进制)
-│   ├── main.go                       # flag/env/信号/退出顺序
+│   ├── main.go                       # flag/信号/退出顺序、三个入口的接线
 │   ├── dnsmap.go                     # dns.txt 条目解析 + 原子热加载
 │   ├── dialer.go                     # 路由决策 + 进程内 tailcat 库 + 直连拨号
 │   ├── stats.go                      # ConnRegistry 会话表 + 原子字节计数
 │   ├── proxy.go                      # SOCKS5 服务端 + RFC1929 认证 + 授权 + relay
+│   ├── httpproxy.go                  # HTTP/HTTPS CONNECT 入口(共享路由与授权)
 │   ├── auth.go                       # 用户表、摘要比较、按用户授权范围
 │   ├── config.go                     # config.yaml 加载与校验
 │   ├── history.go                    # SQLite 历史聚合(按日/IP/域名/端口)

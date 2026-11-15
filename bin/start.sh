@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Start tailcat-proxy in the background.
 # Config via env (all optional):
-#   LISTEN=127.0.0.1:1080  DATA_PATH=<root>/data  PROXY_ARGS="extra flags"
+#   DATA_PATH=<root>/data  PROXY_ARGS="extra flags"
 # DATA_PATH holds dns.txt, config.yaml, tailcat-client-key and history.db.
-# The binary itself reads ADMIN_ADDR (flag > env > default), so just export it;
-# PROXY_ARGS can also pass --admin-addr.
+# Listen addresses live in <DATA_PATH>/config.yaml (listen:), not in flags;
+# PROXY_ARGS can pass extra flags such as --log-level debug.
 # PROXY_ARGS is word-split and glob-expanded by the shell (intended for
 # multiple flags); avoid spaces inside individual flag values.
 set -euo pipefail
@@ -16,7 +16,6 @@ BIN="$ROOT/bin/tailcat-proxy"
 PID_FILE="$RUN_DIR/tailcat-proxy-go.pid"
 LOG_FILE="$RUN_DIR/tailcat-proxy-go.log"
 
-LISTEN="${LISTEN:-127.0.0.1:1080}"
 DATA_PATH="${DATA_PATH:-$ROOT/data}"
 
 mkdir -p "$RUN_DIR"
@@ -53,7 +52,7 @@ fi
 
 : > "$LOG_FILE"   # truncate on each fresh start
 
-ARGS=(--listen "$LISTEN" --data-path "$DATA_PATH")
+ARGS=(--data-path "$DATA_PATH")
 nohup "$BIN" "${ARGS[@]}" ${PROXY_ARGS:-} >>"$LOG_FILE" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
@@ -69,4 +68,4 @@ if ! kill -0 "$PID" 2>/dev/null; then
   exit 1
 fi
 
-echo "started pid $PID  listen=$LISTEN  log=$LOG_FILE"
+echo "started pid $PID  data-path=$DATA_PATH  log=$LOG_FILE"
