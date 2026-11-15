@@ -6,7 +6,9 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -16,24 +18,47 @@ import (
 // 首次启动能跑起来；启动时会 WARN 提示修改。两个用户同名密码是刻意的：
 // 默认配置只是占位，真实部署必须改。
 const configTemplate = `# tailcat-proxy 配置。此文件含明文密码，权限应为 0600。
-socks:
-  users:
-    # tailcat: 只能访问 dns.txt 命中的域名（走隧道）
-    tailcat: "changeme"
-    # all: 可访问任意目标（命中走隧道，未命中直连）
-    all: "changeme"
+listen:
+  # 三个入口，空串表示不监听该入口。改完需重启。
+  http-proxy: "0.0.0.0:7890"
+  socks-proxy: "0.0.0.0:1080"
+  web-console: "127.0.0.1:8080"
+
+users:
+  # tailcat: 只能访问 dns.txt 命中的域名（走隧道）
+  tailcat: "changeme"
+  # all: 可访问任意目标（命中走隧道，未命中直连）
+  all: "changeme"
 
 history:
   # 历史库固定落在 --data-path 目录下的 history.db。
   enabled: true
 `
 
-// Config 是 data/config.yaml 的映射。目前只有 SOCKS 用户与历史记录两组；
-// 新增配置项时同时更新 configTemplate，否则新装用户拿不到默认值。
+// listenDefaults 是三个入口的默认地址。它们同时出现在 configTemplate 里；
+// 缺 listen 段的旧配置也回退到这里，不至于因为少一段就起不来。
+var listenDefaults = Listen{
+	HTTPProxy:  "0.0.0.0:7890",
+	SOCKSProxy: "0.0.0.0:1080",
+	WebConsole: "127.0.0.1:8080",
+}
+
+// Listen 是三个监听入口的地址。空串表示不监听该入口——比如只想要 SOCKS5，
+// 就把 http-proxy 设成 ""。
+type Listen struct {
+	HTTPProxy  string `yaml:"http-proxy"`
+	SOCKSProxy string `yaml:"socks-proxy"`
+	WebConsole string `yaml:"web-console"`
+}
+
+// Config 是 <data-path>/config.yaml 的映射。新增配置项时同时更新
+// configTemplate，否则新装用户拿不到默认值。
+//
+// users 直接在顶层：这个代理只有 SOCKS5 一种入口，"socks:" 包一层只是多一级
+// 缩进而不带来任何区分度。
 type Config struct {
-	Socks struct {
-		Users map[string]string `yaml:"users"`
-	} `yaml:"socks"`
+	Listen  Listen            `yaml:"listen"`
+	Users   map[string]string `yaml:"users"`
 	History struct {
 		// Enabled 只决定要不要记录历史。库的位置不在这里配：所有数据文件
 		// 统一由 --data-path 决定（config.yaml、dns.txt、client key、history.db
@@ -70,17 +95,40 @@ func LoadConfig(path string) (*Config, error) {
 		// 用户拿到的才是"你得配用户"，而不是一句莫名其妙的 EOF。
 		return nil, fmt.Errorf("parse config %s: %w", path, derr)
 	}
-	if len(cfg.Socks.Users) == 0 {
-		// 把期望形状直接写进错误里，省得用户去翻文档。
-		return nil, fmt.Errorf("config %s: socks.users is empty; at least one user is required (authentication is mandatory), e.g.\n  socks:\n    users:\n      tailcat: \"<password>\"", path)
+	// listen 段缺失的字段（含整段缺失）回退到默认值；YAML 里显式写的 ""
+	// 是"不监听"，必须与"没写"区分开——只给没出现的字段填默认值。
+	if cfg.Listen.HTTPProxy == "" && !listenKeyPresent(data, "http-proxy") {
+		cfg.Listen.HTTPProxy = listenDefaults.HTTPProxy
 	}
-	for user, pw := range cfg.Socks.Users {
+	if cfg.Listen.SOCKSProxy == "" && !listenKeyPresent(data, "socks-proxy") {
+		cfg.Listen.SOCKSProxy = listenDefaults.SOCKSProxy
+	}
+	if cfg.Listen.WebConsole == "" && !listenKeyPresent(data, "web-console") {
+		cfg.Listen.WebConsole = listenDefaults.WebConsole
+	}
+	for _, l := range []struct{ name, addr string }{
+		{"http-proxy", cfg.Listen.HTTPProxy},
+		{"socks-proxy", cfg.Listen.SOCKSProxy},
+		{"web-console", cfg.Listen.WebConsole},
+	} {
+		if l.addr == "" {
+			continue // 空串 = 不监听
+		}
+		if err := validateListenAddr(l.addr); err != nil {
+			return nil, fmt.Errorf("config %s: listen.%s: %w", path, l.name, err)
+		}
+	}
+	if len(cfg.Users) == 0 {
+		// 把期望形状直接写进错误里，省得用户去翻文档。
+		return nil, fmt.Errorf("config %s: users is empty; at least one user is required (authentication is mandatory), e.g.\n  users:\n    tailcat: \"<password>\"", path)
+	}
+	for user, pw := range cfg.Users {
 		// 只报用户名，绝不回显密码——这条错误会进日志和终端。
 		if user == "" {
-			return nil, fmt.Errorf("config %s: socks.users[%q] has an empty username", path, user)
+			return nil, fmt.Errorf("config %s: users has an empty username", path)
 		}
 		if strings.TrimSpace(pw) == "" {
-			return nil, fmt.Errorf("config %s: socks.users[%q] has an empty password", path, user)
+			return nil, fmt.Errorf("config %s: users[%q] has an empty password", path, user)
 		}
 		// 用户名决定授权范围，所以拼错的名字（tailatc / Tailcat）不是"多了个
 		// 普通账号"，而是静默放大权限或不生效。在这里就拒掉，别等到构造
@@ -98,6 +146,37 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	return &cfg, nil
+}
+
+// listenKeyPresent 报告 YAML 里 listen.<key> 是否被显式写过。用它区分"没写"
+// 与"写成空串"：前者要补默认值，后者是"不监听"的明确意图。
+func listenKeyPresent(data []byte, key string) bool {
+	var probe struct {
+		Listen map[string]any `yaml:"listen"`
+	}
+	if err := yaml.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+	_, ok := probe.Listen[key]
+	return ok
+}
+
+// validateListenAddr 校验 host:port 形状与端口范围。空 host（":1080"）合法，
+// 表示绑所有接口。
+func validateListenAddr(addr string) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%q: %w (want host:port)", addr, err)
+	}
+	_ = host // 空 host 合法
+	p, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("%q: port %q is not a number", addr, portStr)
+	}
+	if p < 0 || p > 65535 {
+		return fmt.Errorf("%q: port %d out of range", addr, p)
+	}
+	return nil
 }
 
 // writeDefaultConfig 以 O_EXCL 创建默认配置并钉死 0600。写入或关闭失败时删掉
