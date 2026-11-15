@@ -1,4 +1,4 @@
-// tailcat-socks: a SOCKS5 front proxy that rewrites real domain names to
+// tailcat-proxy: a SOCKS5 front proxy that rewrites real domain names to
 // tailcat tokens (tc...) and dials mapped tokens in-process through the
 // tailcat library; targets not found in dns.txt (plain domains and IP
 // literals) are dialed directly. See README.md for usage.
@@ -70,7 +70,7 @@ func main() {
 	if err := lvl.UnmarshalText([]byte(*logLevel)); err != nil {
 		lvl = slog.LevelInfo
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})).With("component", "tailcat-socks"))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})).With("component", "tailcat-proxy"))
 	files, err := newDataFiles(*dataPath)
 	if err != nil {
 		slog.Error("bad --data-path", "value", *dataPath, "err", err)

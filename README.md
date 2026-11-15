@@ -1,4 +1,4 @@
-# tailcat-socks
+# tailcat-proxy
 
 一个带**域名解析**的 SOCKS5 前置代理:把 `curl http://www.example.com/` 里的真实域名,按 `dns.txt` 里的映射改写成 [tailcat](https://github.com/tailscale/tailcat) 的 token(`tc...`),并在**同一进程内**用 tailcat Go 库经 WireGuard/DERP 隧道打到对应机器;**未命中映射的域名与 IP 字面量直接 TCP 拨号**。附带一个 Web 管理页(查看连接、在线编辑 dns.txt)。
 
@@ -60,12 +60,12 @@ cp data/config.yaml.example data/config.yaml && chmod 600 data/config.yaml
 $EDITOR data/config.yaml
 
 # 构建一次(版本号来自 .version)
-(cd src && go build -ldflags="-X main.version=$(cat ../.version)" -o ../bin/tailcat-socks .)
+(cd src && go build -ldflags="-X main.version=$(cat ../.version)" -o ../bin/tailcat-proxy .)
 
 # 前台运行:SOCKS5 127.0.0.1:1080,管理页 http://127.0.0.1:8080/
 # 默认从 ./data 读取 dns.txt / config.yaml / tailcat-client-key,并把
 # history.db 也写在同一个目录。
-bin/tailcat-socks
+bin/tailcat-proxy
 
 # 用起来(必须带凭据)
 curl --socks5-hostname 127.0.0.1:1080 --proxy-user tailcat:你的密码 http://www.example.com:8888/health
@@ -107,8 +107,8 @@ export all_proxy=socks5h://tailcat:你的密码@127.0.0.1:1080
 
 ```bash
 # 本地构建(与镜像一致的版本号)
-(cd src && go build -ldflags="-X main.version=$(tr -d '[:space:]' < .version)" -o ../bin/tailcat-socks .)
-bin/tailcat-socks --version    # 0.9.0
+(cd src && go build -ldflags="-X main.version=$(tr -d '[:space:]' < .version)" -o ../bin/tailcat-proxy .)
+bin/tailcat-proxy --version    # 0.9.0
 ```
 
 直接 `go build` 不带 ldflags 时版本号是 `dev`,不会去猜。
@@ -122,7 +122,7 @@ bin/tailcat-socks --version    # 0.9.0
 如需启用直连(例如确认打洞路径良好),显式设置该变量即可,程序不会覆盖:
 
 ```bash
-TS_DEBUG_ALWAYS_USE_DERP=0 bin/tailcat-socks
+TS_DEBUG_ALWAYS_USE_DERP=0 bin/tailcat-proxy
 ```
 
 ## 配置(`<data-path>/config.yaml`)
@@ -187,13 +187,13 @@ curl --socks5-hostname 127.0.0.1:1080 --proxy-user all:密码 http://example.com
 
 ## 启停脚本(bin/)
 
-后台运行,pid 与 log 在 `run/tailcat-socks-go.{pid,log}`:
+后台运行,pid 与 log 在 `run/tailcat-proxy-go.{pid,log}`:
 
 ```bash
 bin/start.sh          # 后台启动(缺二进制时自动 go build)
 bin/stop.sh           # 停止
 bin/restart.sh        # 重启
-tail -f run/tailcat-socks-go.log
+tail -f run/tailcat-proxy-go.log
 ```
 
 脚本只停止确属本代理的进程(校验 /proc pid 归属);start 后若进程秒退(如 dns 文件不存在、端口被占)会直接报错并以非零码退出,并打印日志尾部。
@@ -214,8 +214,8 @@ docker compose down
 - 容器内 `LISTEN=0.0.0.0:1080`;管理页默认 `127.0.0.1:8080`(**容器内**,宿主机访问不到)。要开放:同时取消 `ADMIN_ADDR: "0.0.0.0:8080"` 与 `8080:8080` 端口映射的注释——注意这等于把无鉴权页面暴露给宿主机网络。
 - tailcat 客户端身份存在命名卷 `tailcat-client-key:/data`,容器重建不丢身份。
 - 容器需能出网(DERP/STUN)。
-- 镜像 runtime 为 `alpine:3.22`(全静态二进制不需要 glibc),**只含一个可执行文件**(tailcat 是库依赖);已发布为 `yaofeng928/tailcat-socks:latest`。
-- 手动构建(等价于 compose):在仓库根目录 `docker build -f docker/Dockerfile -t tailcat-socks .`——context 必须是仓库根,不要写成 `-f docker/Dockerfile ..`(那会把父目录当 context)。
+- 镜像 runtime 为 `alpine:3.22`(全静态二进制不需要 glibc),**只含一个可执行文件**(tailcat 是库依赖);已发布为 `yaofeng928/tailcat-proxy:latest`。
+- 手动构建(等价于 compose):在仓库根目录 `docker build -f docker/Dockerfile -t tailcat-proxy .`——context 必须是仓库根,不要写成 `-f docker/Dockerfile ..`(那会把父目录当 context)。
 
 ## dns.txt 热加载
 
@@ -224,7 +224,7 @@ docker compose down
 ## 目录结构
 
 ```
-tailcat-socks/
+tailcat-proxy/
 ├── src/                              # Go 版(idiomatic Go;单二进制)
 │   ├── main.go                       # flag/env/信号/退出顺序
 │   ├── dnsmap.go                     # dns.txt 条目解析 + 原子热加载
@@ -237,7 +237,7 @@ tailcat-socks/
 │   ├── admin.go                      # 管理页 HTTP API(go:embed + 单页)
 │   ├── static/index.html             # 管理页(编译期内嵌)
 │   └── *_test.go                     # 单元 + 本地端到端(全离线)
-├── bin/                              # 启停脚本 {start,stop,restart}.sh + 构建产物 tailcat-socks(gitignore)
+├── bin/                              # 启停脚本 {start,stop,restart}.sh + 构建产物 tailcat-proxy(gitignore)
 ├── docker/{Dockerfile,docker-compose.yml}
 ├── docs/superpowers/                 # Go 版设计文档与实现计划
 ├── data/

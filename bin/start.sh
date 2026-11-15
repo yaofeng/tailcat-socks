@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start tailcat-socks in the background.
+# Start tailcat-proxy in the background.
 # Config via env (all optional):
 #   LISTEN=127.0.0.1:1080  DATA_PATH=<root>/data  PROXY_ARGS="extra flags"
 # DATA_PATH holds dns.txt, config.yaml, tailcat-client-key and history.db.
@@ -12,9 +12,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="$ROOT/run"
 
-BIN="$ROOT/bin/tailcat-socks"
-PID_FILE="$RUN_DIR/tailcat-socks-go.pid"
-LOG_FILE="$RUN_DIR/tailcat-socks-go.log"
+BIN="$ROOT/bin/tailcat-proxy"
+PID_FILE="$RUN_DIR/tailcat-proxy-go.pid"
+LOG_FILE="$RUN_DIR/tailcat-proxy-go.log"
 
 LISTEN="${LISTEN:-127.0.0.1:1080}"
 DATA_PATH="${DATA_PATH:-$ROOT/data}"
@@ -27,7 +27,7 @@ mkdir -p "$RUN_DIR"
 is_ours() {
   local token
   while IFS= read -r -d '' token; do
-    [[ "$token" == *tailcat-socks ]] && return 0
+    [[ "$token" == *tailcat-proxy ]] && return 0
   done 2>/dev/null < "/proc/$1/cmdline"
   return 1
 }
@@ -48,7 +48,7 @@ fi
 if [[ ! -x "$BIN" ]]; then
   echo "go binary missing; building (go build)..."
   VER="$(tr -d '[:space:]' < "$ROOT/.version" 2>/dev/null || echo dev)"
-  (cd "$ROOT/src" && go build -ldflags="-X main.version=$VER" -o "$ROOT/bin/tailcat-socks" .)
+  (cd "$ROOT/src" && go build -ldflags="-X main.version=$VER" -o "$ROOT/bin/tailcat-proxy" .)
 fi
 
 : > "$LOG_FILE"   # truncate on each fresh start

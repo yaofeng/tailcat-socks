@@ -1,9 +1,9 @@
 run/
+bin/tailcat-proxy
 data/dns.txt
-bin/tailcat-socks
 data/tailcat-client-key
-src/tailcat-socks
 data/config.yaml
 data/history.db
 data/history.db-wal
 data/history.db-shm
+src/tailcat-proxy

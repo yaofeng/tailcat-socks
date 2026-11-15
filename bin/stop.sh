@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Stop tailcat-socks (and its auto-launched tailcat socks child, which
+# Stop tailcat-proxy (and its auto-launched tailcat socks child, which
 # the proxy terminates on SIGTERM via its signal handler).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PID_FILE="$ROOT/run/tailcat-socks-go.pid"
+PID_FILE="$ROOT/run/tailcat-proxy-go.pid"
 
-# Only signal a pid that really is a tailcat-socks: a pid file can outlive
+# Only signal a pid that really is a tailcat-proxy: a pid file can outlive
 # a reboot and land on an unrelated process. Match exact argv tokens, not
-# substrings — e.g. `tail -f run/tailcat-socks-go.log` mentions the proxy
+# substrings — e.g. `tail -f run/tailcat-proxy-go.log` mentions the proxy
 # but is not the proxy.
 is_ours() {
   local token
   while IFS= read -r -d '' token; do
-    [[ "$token" == *tailcat-socks ]] && return 0
+    [[ "$token" == *tailcat-proxy ]] && return 0
   done 2>/dev/null < "/proc/$1/cmdline"
   return 1
 }

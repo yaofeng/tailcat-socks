@@ -15,7 +15,7 @@ import (
 // configTemplate 是 config.yaml 缺失时落盘的模板。密码给 changeme 只是为了让
 // 首次启动能跑起来；启动时会 WARN 提示修改。两个用户同名密码是刻意的：
 // 默认配置只是占位，真实部署必须改。
-const configTemplate = `# tailcat-socks 配置。此文件含明文密码，权限应为 0600。
+const configTemplate = `# tailcat-proxy 配置。此文件含明文密码，权限应为 0600。
 socks:
   users:
     # tailcat: 只能访问 dns.txt 命中的域名（走隧道）

@@ -1,4 +1,4 @@
-# tailcat-socks 配置示例。复制到 --data-path 目录（默认 data/）下命名为
+# tailcat-proxy 配置示例。复制到 --data-path 目录（默认 data/）下命名为
 # config.yaml 并修改密码。真实配置文件含明文密码，已被 git 忽略，权限请保持 0600。
 socks:
   users:

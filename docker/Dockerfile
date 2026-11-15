@@ -19,14 +19,14 @@ WORKDIR /build
 COPY src/go.mod src/go.sum ./
 RUN go mod download
 COPY src/ ./
-RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/tailcat-socks .
+RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/tailcat-proxy .
 
 # ALPINE runtime keeps the image small; the binary is fully static (CGO off).
 FROM alpine:3.22
 
 RUN apk add --no-cache ca-certificates
 
-COPY --from=build /out/tailcat-socks /usr/local/bin/tailcat-socks
+COPY --from=build /out/tailcat-proxy /usr/local/bin/tailcat-proxy
 
 WORKDIR /app
 # dns.txt and config.yaml hold real tokens and plaintext passwords and are
@@ -48,4 +48,4 @@ VOLUME ["/data"]
 
 # exec so PID 1 forwards signals -> proxy runs its shutdown order
 # (SOCKS listener, relays, admin Shutdown(1s), tailcat clients).
-CMD ["sh", "-c", "exec tailcat-socks --listen \"$LISTEN\" --admin-addr \"$ADMIN_ADDR\" --data-path \"$DATA_PATH\""]
+CMD ["sh", "-c", "exec tailcat-proxy --listen \"$LISTEN\" --admin-addr \"$ADMIN_ADDR\" --data-path \"$DATA_PATH\""]

@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE: yaofeng928/tailcat-socks
+  IMAGE: yaofeng928/tailcat-proxy
 
 jobs:
   test:
@@ -64,12 +64,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          # v<.version> is the release tag (e.g. v0.10.0); latest tracks main;
+          # the sha tag pins every build immutably. Kept as a plain list with no
+          # inline comments so the action's line parser sees only tag specs.
           tags: |
-            # v<.version> — the release tag, e.g. v0.9.0
             type=raw,value=v${{ steps.ver.outputs.version }}
-            # latest tracks main
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            # immutable sha tag for every build
             type=sha,format=short
 
       - name: Build and push
@@ -87,4 +87,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=gha
+          # mode=max caches every intermediate layer (not just the final one),
+          # which is what makes the dependency-download layer reusable.
+          # "mode=gha" is not a valid value — GHA cache only accepts min or max.
+          cache-to: type=gha,mode=max

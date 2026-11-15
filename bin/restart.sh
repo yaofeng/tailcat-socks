@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restart tailcat-socks.
+# Restart tailcat-proxy.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$DIR/stop.sh"
