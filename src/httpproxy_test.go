@@ -146,8 +146,21 @@ func TestHTTPProxyMatchedOnlyTunnelsMatchedHost(t *testing.T) {
 }
 
 // 普通 HTTP 请求：绝对 URI 要改写成 origin-form 再转发。
+// 普通 HTTP 请求：绝对 URI 要改写成 origin-form 再转发**给上游**。
+//
+// 上游用"记录 + 回真实响应"的服务器，而不是 echo：echo 会把字节反弹回
+// 客户端，那样即使代理把请求写错了方向（写回客户端、上游收不到），测试
+// 也会通过。这正是本用例存在的原因——它必须能区分两个方向。
 func TestHTTPProxyForwardsAbsoluteURIAsOriginForm(t *testing.T) {
-	fd := dialerToEcho(t)
+	got := make(chan string, 1)
+	origin := plainServer(t, func(conn net.Conn) {
+		defer conn.Close()
+		buf := make([]byte, 512)
+		n, _ := conn.Read(buf)
+		got <- string(buf[:n])
+		conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"))
+	})
+	fd := &fakeDialer{targets: make(chan Target, 8), addrs: map[string]string{ViaTunnel: origin, ViaDirect: origin}}
 	hp := newHTTPProxy(t, map[string]string{"a.example.com": "tcAAA"}, fd, httpUsers())
 
 	c, err := net.DialTimeout("tcp", hp.ActualAddr().String(), 2*time.Second)
@@ -161,19 +174,30 @@ func TestHTTPProxyForwardsAbsoluteURIAsOriginForm(t *testing.T) {
 	if _, err := c.Write([]byte(req)); err != nil {
 		t.Fatal(err)
 	}
-	// echo server 会把收到的字节原样回显（带 ECHO: 前缀），从里面能看到经
-	// 改写的请求行。
-	buf := make([]byte, 256)
-	n, err := c.Read(buf)
+
+	// 客户端收到的必须是上游的响应，而不是被改写后的请求。
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: "GET"})
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatalf("client should receive the origin's response: %v", err)
 	}
-	got := string(buf[:n])
-	if !strings.Contains(got, "GET /path?q=1 HTTP/1.1") {
-		t.Errorf("forwarded request line should be origin-form, got %q", got)
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
-	if strings.Contains(got, "http://a.example.com") {
-		t.Errorf("absolute URI must be stripped, got %q", got)
+
+	// 上游收到的必须是 origin-form 请求行，且没有代理凭据。
+	select {
+	case line := <-got:
+		if !strings.Contains(line, "GET /path?q=1 HTTP/1.1") {
+			t.Errorf("upstream got %q, want origin-form request line", line)
+		}
+		if strings.Contains(line, "http://a.example.com") {
+			t.Errorf("absolute URI must be stripped, got %q", line)
+		}
+		if strings.Contains(strings.ToLower(line), "proxy-authorization") {
+			t.Errorf("Proxy-Authorization must not reach the origin, got %q", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("origin never received the forwarded request")
 	}
 }
 

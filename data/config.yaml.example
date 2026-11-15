@@ -1,11 +1,17 @@
 # tailcat-proxy 配置示例。复制到 --data-path 目录（默认 data/）下命名为
 # config.yaml 并修改密码。真实配置文件含明文密码，已被 git 忽略，权限请保持 0600。
-socks:
-  users:
-    # tailcat: 只能访问 dns.txt 命中的域名（走隧道）
-    tailcat: "changeme"
-    # all: 可访问任意目标（命中走隧道，未命中直连）
-    all: "changeme"
+listen:
+  # 三个入口，空串表示不监听该入口。改完需重启。
+  # 至少要配一个代理入口（http-proxy 或 socks-proxy）。
+  http-proxy: "0.0.0.0:7890"
+  socks-proxy: "0.0.0.0:1080"
+  web-console: "127.0.0.1:8080"
+
+users:
+  # tailcat: 只能访问 dns.txt 命中的域名（走隧道）
+  tailcat: "changeme"
+  # all: 可访问任意目标（命中走隧道，未命中直连）
+  all: "changeme"
 
 history:
   # 关掉后不打开数据库，管理页的"历史连接"标签会显示未启用。

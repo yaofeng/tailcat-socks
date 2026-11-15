@@ -127,7 +127,11 @@ func socksFail(client net.Conn) {
 // 状态行加头部；而且失败回执必须由协议层写，serveTunnel 不该知道任何协议。
 type tunnelHandlers struct {
 	onDialError func(err error)
-	onReady     func(client net.Conn) error
+	// onReady 在拨号成功后、进入 relay 前调用，拿到两条连接：往 client 写
+	// 是给调用方的回执（SOCKS5 的 reply、CONNECT 的 200），往 up 写是把
+	// 首个请求转发给上游（普通 HTTP 的情形）。只给一条连接不够——同一个
+	// 钩子对两种协议的方向不同，签名含糊过一次，别再来第二次。
+	onReady func(client, up net.Conn) error
 }
 
 // serveTunnel 是一条已授权连接的完整生命周期：注册会话、拨号、回执、
@@ -160,7 +164,7 @@ func (s *Server) serveTunnel(client net.Conn, host string, port uint16, target T
 		return
 	}
 	if h.onReady != nil {
-		if err := h.onReady(client); err != nil {
+		if err := h.onReady(client, up); err != nil {
 			up.Close()
 			return
 		}
@@ -263,7 +267,7 @@ func (s *Server) serveConn(client net.Conn) {
 
 	s.serveTunnel(client, host, port, target, tunnelHandlers{
 		onDialError: func(error) { socksFail(client) },
-		onReady: func(c net.Conn) error {
+		onReady: func(c, _ net.Conn) error {
 			_, err := c.Write(socksOKReply)
 			return err
 		},

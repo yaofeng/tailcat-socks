@@ -132,7 +132,7 @@ func (h *HTTPProxy) serveConnect(conn net.Conn, req *http.Request, user User) {
 	conn.SetDeadline(time.Now().Add(h.handshake))
 	h.srv.serveTunnel(conn, host, port, target, tunnelHandlers{
 		onDialError: func(error) { writeHTTPStatus(conn, http.StatusBadGateway, nil) },
-		onReady: func(c net.Conn) error {
+		onReady: func(c, _ net.Conn) error {
 			_, werr := c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 			return werr
 		},
@@ -169,7 +169,10 @@ func (h *HTTPProxy) serveAbsoluteURI(conn net.Conn, br *bufio.Reader, req *http.
 	conn.SetDeadline(time.Now().Add(h.handshake))
 	h.srv.serveTunnel(conn, host, p, target, tunnelHandlers{
 		onDialError: func(error) { writeHTTPStatus(conn, http.StatusBadGateway, nil) },
-		onReady: func(c net.Conn) error {
+		// 普通 HTTP 没有"回执"这一步：请求本身必须写往**上游**。写错方向
+		// 会把改写后的请求行回给客户端，客户端会把它当响应读（curl 报
+		// "HTTP/0.9 not allowed"），而上游一个字节都收不到。
+		onReady: func(_, up net.Conn) error {
 			// 改写请求行：绝对 URI -> origin-form。其余头部原样保留，
 			// 但要剥掉 Proxy-Authorization（那是给代理的，不该泄露给目标）。
 			out := new(strings.Builder)
@@ -188,7 +191,7 @@ func (h *HTTPProxy) serveAbsoluteURI(conn net.Conn, br *bufio.Reader, req *http.
 				}
 			}
 			out.WriteString("\r\n")
-			_, werr := c.Write([]byte(out.String()))
+			_, werr := up.Write([]byte(out.String()))
 			return werr
 		},
 	})
