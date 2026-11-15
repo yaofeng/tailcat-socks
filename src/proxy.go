@@ -122,6 +122,56 @@ func socksFail(client net.Conn) {
 	_, _ = client.Write(socksFailReply)
 }
 
+// tunnelHandlers 是协议层提供的两个钩子：拨号失败时怎么回包，拨号成功后
+// 怎么回执。分开是因为两者形式不同——SOCKS5 是两串固定字节，HTTP 是一个
+// 状态行加头部；而且失败回执必须由协议层写，serveTunnel 不该知道任何协议。
+type tunnelHandlers struct {
+	onDialError func(err error)
+	onReady     func(client net.Conn) error
+}
+
+// serveTunnel 是一条已授权连接的完整生命周期：注册会话、拨号、回执、
+// relay、记历史。它拥有 client 与 up 两条连接并负责关闭。
+//
+// 授权必须在调用本函数之前完成——这里不再看用户权限，只执行已经批准的目标。
+// 被拒的请求绝不能走到这里：否则会被记成一次失败访问。
+func (s *Server) serveTunnel(client net.Conn, host string, port uint16, target Target, h tunnelHandlers) {
+	sess := s.Registry.New(client.RemoteAddr().String(), host, target.Host, int(target.Port), target.Via)
+	defer s.Registry.Drop(sess.ID)
+	// 连接结束时并入历史。failed 取反 Opened：没进 relay 的会话就是失败
+	// （拨号失败或客户端在回执后立刻断开）。
+	defer func() {
+		if s.History == nil {
+			return
+		}
+		ip := clientIP(client.RemoteAddr())
+		s.History.Record(time.Now().Format("2006-01-02"), ip, host, int(port),
+			!sess.Opened, sess.BytesUp.Load(), sess.BytesDown.Load())
+	}()
+
+	up, err := s.Dialer.Dial(context.Background(), target)
+	// 拨号可能吃满了握手预算；给回执一个新窗口，与重构前一致。
+	client.SetDeadline(time.Now().Add(s.handshakeTimeout))
+	if err != nil {
+		slog.Warn("dial failed", "via", target.Via, "host", host, "port", target.Port, "err", err)
+		if h.onDialError != nil {
+			h.onDialError(err)
+		}
+		return
+	}
+	if h.onReady != nil {
+		if err := h.onReady(client); err != nil {
+			up.Close()
+			return
+		}
+	}
+	s.Registry.MarkOpen(sess)
+
+	client.SetDeadline(time.Time{})
+	up.SetDeadline(time.Time{})
+	relay(client, up, s.relayIdle, sess)
+}
+
 // serveConn runs the SOCKS5 exchange on one connection: USERNAME/PASSWORD
 // greeting, RFC 1929 sub-negotiation, then CONNECT-only with ATYP 1/3/4. After
 // routing it enforces the user's reach, then dials and relays. A connection
@@ -211,35 +261,13 @@ func (s *Server) serveConn(client net.Conn) {
 		return
 	}
 
-	sess := s.Registry.New(client.RemoteAddr().String(), host, target.Host, int(target.Port), target.Via)
-	defer s.Registry.Drop(sess.ID)
-	// 连接结束时并入历史。failed 取反 Opened：没进 relay 的会话就是失败
-	// （拨号失败或客户端在回执后立刻断开）。
-	defer func() {
-		if s.History == nil {
-			return
-		}
-		ip := clientIP(client.RemoteAddr())
-		s.History.Record(time.Now().Format("2006-01-02"), ip, host, int(port),
-			!sess.Opened, sess.BytesUp.Load(), sess.BytesDown.Load())
-	}()
-
-	up, err := s.Dialer.Dial(context.Background(), target)
-	client.SetDeadline(time.Now().Add(s.handshakeTimeout))
-	if err != nil {
-		slog.Warn("dial failed", "via", target.Via, "host", host, "port", target.Port, "err", err)
-		socksFail(client)
-		return
-	}
-	if _, err := client.Write(socksOKReply); err != nil {
-		up.Close()
-		return
-	}
-	s.Registry.MarkOpen(sess)
-
-	client.SetDeadline(time.Time{})
-	up.SetDeadline(time.Time{})
-	relay(client, up, s.relayIdle, sess)
+	s.serveTunnel(client, host, port, target, tunnelHandlers{
+		onDialError: func(error) { socksFail(client) },
+		onReady: func(c net.Conn) error {
+			_, err := c.Write(socksOKReply)
+			return err
+		},
+	})
 }
 
 // userPassAuth 是一次 RFC 1929 子协商的结果。
